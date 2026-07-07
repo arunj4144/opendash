@@ -1,0 +1,20 @@
+# Android / Gradle
+*.iml
+.gradle/
+/local.properties
+.idea/
+.DS_Store
+build/
+app/build/
+captures/
+.externalNativeBuild/
+.cxx/
+*.apk
+*.aab
+
+# ML training artifacts (regenerate via ml/train_maneuver_model.py)
+ml/.venv/
+ml/_saved_model/
+ml/dataset/
+ml/*.log
+ml/*.tflite
