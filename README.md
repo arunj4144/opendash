@@ -100,17 +100,24 @@ friendly greeting on connect and call answer/reject from the handlebar.
 
 ## Screenshots
 
-| App home | Settings | Pairing / search |
-|---|---|---|
-| ![](docs/screenshots/app-ui.png) | ![](docs/screenshots/settings.png) | ![](docs/screenshots/pairing-search.png) |
+Pick your brand on first run and the whole app re-themes - KTM (dark) or Husqvarna (light):
 
-| Onboarding | Dash mirror preview | Turn-icon calibration |
-|---|---|---|
-| ![](docs/screenshots/onboarding.png) | ![](docs/screenshots/mirror.png) | ![](docs/screenshots/turn-calibration.png) |
+| Brand select (KTM) | Brand select (Husqvarna) |
+|---|---|
+| ![](docs/screenshots/brand-select-ktm.png) | ![](docs/screenshots/brand-select-husqvarna.png) |
 
-| Symbol testing | Roundabout icons | Handlebar gamepad |
-|---|---|---|
-| ![](docs/screenshots/symbol-testing.png) | ![](docs/screenshots/roundabout-icons.png) | ![](docs/screenshots/handlebar-gamepad.png) |
+| Home (KTM) | Home (Husqvarna) |
+|---|---|
+| ![](docs/screenshots/home-ktm.png) | ![](docs/screenshots/home-husqvarna.png) |
+
+| Ride tools and sounds | Engine-vibration calibration |
+|---|---|
+| ![](docs/screenshots/riding-settings.png) | ![](docs/screenshots/engine-calibration.png) |
+
+More from earlier builds: [dash mirror preview](docs/screenshots/mirror.png),
+[turn-icon calibration](docs/screenshots/turn-calibration.png),
+[symbol testing](docs/screenshots/symbol-testing.png),
+[handlebar gamepad](docs/screenshots/handlebar-gamepad.png).
 
 ## Install (no build needed)
 
