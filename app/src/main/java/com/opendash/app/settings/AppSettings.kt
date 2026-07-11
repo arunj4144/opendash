@@ -34,13 +34,32 @@ class AppSettings(context: Context) {
     private val pairingPrefs: SharedPreferences =
         context.getSharedPreferences("opendash_pairing", Context.MODE_PRIVATE)
 
+    // Bonded bike identity lives in the PLAIN store: EncryptedSharedPreferences
+    // silently resets on some devices/updates (documented on pairingPrefs), and
+    // every reset threw the rider back to the pairing screen ("always asking to
+    // re-pair", R21/R22 field reports - observed directly after the R21 update).
+    // A BLE MAC isn't a secret. Reads fall back to the legacy encrypted store
+    // once, migrating bikes paired by older builds; writes clear the legacy copy
+    // so a stale encrypted value can't resurrect after "Re-pair vehicle".
     var bondedDeviceAddress: String?
-        get() = prefs.getString(KEY_BONDED_ADDRESS, null)
-        set(value) = prefs.edit().putString(KEY_BONDED_ADDRESS, value).apply()
+        get() = pairingPrefs.getString(KEY_BONDED_ADDRESS, null)
+            ?: runCatching { prefs.getString(KEY_BONDED_ADDRESS, null) }.getOrNull()?.also {
+                pairingPrefs.edit().putString(KEY_BONDED_ADDRESS, it).apply()
+            }
+        set(value) {
+            pairingPrefs.edit().putString(KEY_BONDED_ADDRESS, value).commit()
+            runCatching { prefs.edit().remove(KEY_BONDED_ADDRESS).apply() }
+        }
 
     var bondedDeviceName: String?
-        get() = prefs.getString(KEY_BONDED_NAME, null)
-        set(value) = prefs.edit().putString(KEY_BONDED_NAME, value).apply()
+        get() = pairingPrefs.getString(KEY_BONDED_NAME, null)
+            ?: runCatching { prefs.getString(KEY_BONDED_NAME, null) }.getOrNull()?.also {
+                pairingPrefs.edit().putString(KEY_BONDED_NAME, it).apply()
+            }
+        set(value) {
+            pairingPrefs.edit().putString(KEY_BONDED_NAME, value).commit()
+            runCatching { prefs.edit().remove(KEY_BONDED_NAME).apply() }
+        }
 
     var geminiApiKey: String?
         get() = prefs.getString(KEY_GEMINI_KEY, null)
@@ -55,6 +74,20 @@ class AppSettings(context: Context) {
     var onboardingComplete: Boolean
         get() = prefs.getBoolean(KEY_ONBOARDING_COMPLETE, false)
         set(value) = prefs.edit().putBoolean(KEY_ONBOARDING_COMPLETE, value).apply()
+
+    /**
+     * Selected motorcycle brand — drives the whole app's theme (KTM dark/orange,
+     * Husqvarna light/blue). Plain store so it survives the encrypted-prefs reset
+     * that also wiped the bonded bike (see [bondedDeviceAddress]).
+     */
+    var brand: com.opendash.app.ui.theme.Brand
+        get() = com.opendash.app.ui.theme.Brand.fromId(pairingPrefs.getString(KEY_BRAND, null))
+        set(value) = pairingPrefs.edit().putString(KEY_BRAND, value.id).apply()
+
+    /** True once the rider has explicitly picked a brand (so first-run shows brand select). */
+    var brandChosen: Boolean
+        get() = pairingPrefs.contains(KEY_BRAND)
+        set(value) { if (!value) pairingPrefs.edit().remove(KEY_BRAND).apply() }
 
     /** Used to personalize the test notification and greeting text ("Hey <name>"). */
     var userName: String?
@@ -97,6 +130,16 @@ class AppSettings(context: Context) {
         set(value) = pairingPrefs.edit().putBoolean(KEY_GAMEPAD_ENABLED, value).apply()
 
     /**
+     * What the handlebar remote does with its buttons: [MODE_MEDIA] (play/pause,
+     * next/prev), [MODE_GAMEPAD] (navigate other phone apps via accessibility),
+     * or [MODE_DASH] (open/drive Navigator Gen3's own menu). Triple-press Up on
+     * the remote pops an overlay to switch. Default: media.
+     */
+    var remoteMode: String
+        get() = pairingPrefs.getString(KEY_REMOTE_MODE, MODE_MEDIA) ?: MODE_MEDIA
+        set(value) = pairingPrefs.edit().putString(KEY_REMOTE_MODE, value).apply()
+
+    /**
      * Whether we've ever completed the BCCU handshake with this bike before.
      * The bike decides whether to show its physical "confirm new pairing"
      * prompt based on whether our reply to its cmd=HELLO is "I don't know you"
@@ -133,6 +176,77 @@ class AppSettings(context: Context) {
         runCatching { prefs.edit().remove(key).commit() }
     }
 
+    /** Stereo beep pattern as a turn approaches (left ear = left turn). */
+    var turnBeepEnabled: Boolean
+        get() = pairingPrefs.getBoolean(KEY_TURN_BEEP, true)
+        set(value) = pairingPrefs.edit().putBoolean(KEY_TURN_BEEP, value).apply()
+
+    /** Turn-beep loudness, 5..100 (%). Default deliberately gentle - the R20 field test found full volume grating. */
+    var beepVolumePercent: Int
+        get() = pairingPrefs.getInt(KEY_BEEP_VOLUME, DEFAULT_BEEP_VOLUME)
+        set(value) = pairingPrefs.edit().putInt(KEY_BEEP_VOLUME, value.coerceIn(5, 100)).apply()
+
+    /**
+     * Adaptive power: high-refresh sensors/GPS only while the phone is charging
+     * (the usual state on the bike mount); duty-cycled/off on battery. Turning
+     * this OFF keeps everything high-refresh regardless of charge state.
+     */
+    var powerSaveEnabled: Boolean
+        get() = pairingPrefs.getBoolean(KEY_POWER_SAVE, true)
+        set(value) = pairingPrefs.edit().putBoolean(KEY_POWER_SAVE, value).apply()
+
+    /** Detect the engine running from the phone's accelerometer (needs calibration). */
+    var engineDetectEnabled: Boolean
+        get() = pairingPrefs.getBoolean(KEY_ENGINE_DETECT, false)
+        set(value) = pairingPrefs.edit().putBoolean(KEY_ENGINE_DETECT, value).apply()
+
+    /** Calibrated vibration RMS with the bike off / idling, from the guided calibration. NaN = uncalibrated. */
+    var vibrationIdleRms: Float
+        get() = pairingPrefs.getFloat(KEY_VIB_IDLE_RMS, Float.NaN)
+        set(value) = pairingPrefs.edit().putFloat(KEY_VIB_IDLE_RMS, value).apply()
+
+    var vibrationEngineRms: Float
+        get() = pairingPrefs.getFloat(KEY_VIB_ENGINE_RMS, Float.NaN)
+        set(value) = pairingPrefs.edit().putFloat(KEY_VIB_ENGINE_RMS, value).apply()
+
+    /**
+     * Engine-detection sensitivity trim, -50..+50 (%). Negative shifts the
+     * on/off threshold DOWN (more sensitive - detects a gentler idle), positive
+     * shifts it up (fewer false "engine on" from road rumble). 0 = calibrated midpoint.
+     */
+    var vibrationSensitivity: Int
+        get() = pairingPrefs.getInt(KEY_VIB_SENSITIVITY, 0)
+        set(value) = pairingPrefs.edit().putInt(KEY_VIB_SENSITIVITY, value.coerceIn(-50, 50)).apply()
+
+    /** Swap the beep left/right channels (default on - matched the rider's headset in the field). */
+    var swapBeepChannels: Boolean
+        get() = pairingPrefs.getBoolean(KEY_SWAP_BEEP_CHANNELS, true)
+        set(value) = pairingPrefs.edit().putBoolean(KEY_SWAP_BEEP_CHANNELS, value).apply()
+
+    /** GPS overspeed alert on/off. */
+    var overspeedEnabled: Boolean
+        get() = pairingPrefs.getBoolean(KEY_OVERSPEED_ENABLED, true)
+        set(value) = pairingPrefs.edit().putBoolean(KEY_OVERSPEED_ENABLED, value).apply()
+
+    /** Speed (km/h) above which the overspeed alert fires. Alert clears at limit − 10. */
+    var overspeedLimitKmh: Int
+        get() = pairingPrefs.getInt(KEY_OVERSPEED_LIMIT, DEFAULT_OVERSPEED_LIMIT_KMH)
+        set(value) = pairingPrefs.edit().putInt(KEY_OVERSPEED_LIMIT, value).apply()
+
+    /** Saved waypoint ("lat,lon"), usable as a Google Maps navigation target. Null = none set. */
+    var waypoint: String?
+        get() = pairingPrefs.getString(KEY_WAYPOINT, null)
+        set(value) = pairingPrefs.edit().putString(KEY_WAYPOINT, value).apply()
+
+    var waypointName: String?
+        get() = pairingPrefs.getString(KEY_WAYPOINT_NAME, null)
+        set(value) = pairingPrefs.edit().putString(KEY_WAYPOINT_NAME, value).apply()
+
+    /** Auto-record GPS routes to GPX, but only while the phone is charging. */
+    var routeAutoRecordEnabled: Boolean
+        get() = pairingPrefs.getBoolean(KEY_ROUTE_RECORD, false)
+        set(value) = pairingPrefs.edit().putBoolean(KEY_ROUTE_RECORD, value).apply()
+
     /** Manual hardware-calibration result for one icon, from the Symbol Testing screen. "works", "wrong", or null (untested). */
     fun getIconTestResult(key: String): String? = prefs.getString(KEY_ICON_TEST_PREFIX + key, null)
 
@@ -164,6 +278,7 @@ class AppSettings(context: Context) {
         private const val KEY_GEMINI_MODEL = "gemini_model"
         private const val KEY_ONBOARDING_COMPLETE = "onboarding_complete"
         private const val KEY_USER_NAME = "user_name"
+        private const val KEY_BRAND = "brand"
 
         const val DEFAULT_GEMINI_MODEL = "gemini-2.0-flash"
 
@@ -181,6 +296,25 @@ class AppSettings(context: Context) {
         private const val KEY_MIRROR_ENABLED = "mirror_enabled"
         private const val KEY_MARQUEE_ENABLED = "marquee_enabled"
         private const val KEY_GAMEPAD_ENABLED = "gamepad_enabled"
+        private const val KEY_REMOTE_MODE = "remote_mode"
+        const val MODE_MEDIA = "media"
+        const val MODE_GAMEPAD = "gamepad"
+        const val MODE_DASH = "dash"
+        private const val KEY_TURN_BEEP = "turn_beep_enabled"
+        private const val KEY_BEEP_VOLUME = "beep_volume_percent"
+        const val DEFAULT_BEEP_VOLUME = 35
+        private const val KEY_POWER_SAVE = "power_save_enabled"
+        private const val KEY_ENGINE_DETECT = "engine_detect_enabled"
+        private const val KEY_VIB_IDLE_RMS = "vibration_idle_rms"
+        private const val KEY_VIB_ENGINE_RMS = "vibration_engine_rms"
+        private const val KEY_VIB_SENSITIVITY = "vibration_sensitivity"
+        private const val KEY_SWAP_BEEP_CHANNELS = "swap_beep_channels"
+        private const val KEY_OVERSPEED_ENABLED = "overspeed_enabled"
+        private const val KEY_OVERSPEED_LIMIT = "overspeed_limit_kmh"
+        const val DEFAULT_OVERSPEED_LIMIT_KMH = 80
+        private const val KEY_WAYPOINT = "waypoint_latlon"
+        private const val KEY_WAYPOINT_NAME = "waypoint_name"
+        private const val KEY_ROUTE_RECORD = "route_auto_record"
         private const val KEY_PAIRED_PREFIX = "paired_before_"
         private const val KEY_ICON_TEST_PREFIX = "icon_test_"
         private const val KEY_TURN_CAL_PREFIX = "turncal_"

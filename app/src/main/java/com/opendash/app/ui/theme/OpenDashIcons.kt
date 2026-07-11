@@ -113,6 +113,10 @@ object OpenDashIcons {
         lucide("ChevronLeft", 1.9f, "M15 18l-6-6 6-6")
     }
 
+    val ChevronRight: ImageVector by lazy {
+        lucide("ChevronRight", 1.9f, "M9 18l6-6-6-6")
+    }
+
     val Bluetooth: ImageVector by lazy {
         lucide("Bluetooth", 1.8f, "M7 7l10 10-5 5V2l5 5L7 17")
     }

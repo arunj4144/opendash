@@ -45,9 +45,21 @@ import com.opendash.app.ui.theme.OpenDashTheme
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
-private enum class AppRoute { ONBOARDING, PAIRING, MAIN, SETTINGS, LOGS, SYMBOL_TEST, TURN_CALIBRATION }
+private enum class AppRoute { BRAND, ONBOARDING, PAIRING, MAIN, SETTINGS, LOGS, SYMBOL_TEST, TURN_CALIBRATION, VIBRATION_CALIBRATION, RIDES }
 
 class MainActivity : ComponentActivity() {
+
+    companion object {
+        /**
+         * GPX handed to us via ACTION_VIEW (file manager, WhatsApp, …), already
+         * copied into the routes folder. Compose observes this to jump to the
+         * ride viewer; cleared when the viewer is left. A flow (not an intent
+         * extra) because with launchMode=singleTask a second GPX arrives via
+         * onNewIntent on the LIVE activity - there is no recomposition-from-
+         * scratch to re-read an extra from.
+         */
+        val importedGpx = kotlinx.coroutines.flow.MutableStateFlow<java.io.File?>(null)
+    }
 
     private lateinit var settings: AppSettings
     private lateinit var mediaControl: MediaControlBridge
@@ -58,7 +70,12 @@ class MainActivity : ComponentActivity() {
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
-    ) { /* best-effort; features degrade gracefully if denied */ }
+    ) {
+        // The long-lived connection service usually starts BEFORE this async
+        // grant lands - tell it to re-check location-gated features (overspeed
+        // monitor, route recorder, FGS location type) now.
+        BccuConnectionService.reevaluateLocationIfRunning()
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -70,6 +87,9 @@ class MainActivity : ComponentActivity() {
         WindowCompat.setDecorFitsSystemWindows(window, false)
 
         settings = AppSettings(this)
+        // Apply the saved brand theme before the first frame so the app opens in
+        // the right skin (KTM dark / Husqvarna light) with no flash of the wrong one.
+        com.opendash.app.ui.theme.Ktm.applyBrand(settings.brand)
         mediaControl = MediaControlBridge(this)
         callAudioRouter = CallAudioRouter(this)
 
@@ -118,6 +138,13 @@ class MainActivity : ComponentActivity() {
                     BccuProtocol.NotificationIcon.NOTIFICATION_WAYPOINT
                 )
             }
+            override fun exitApp() {
+                // Stop the foreground service (removes its ongoing notification),
+                // cancel any of our notifications, then remove the app task entirely.
+                BccuConnectionService.stop(this@MainActivity)
+                (getSystemService(NOTIFICATION_SERVICE) as android.app.NotificationManager).cancelAll()
+                finishAndRemoveTask()
+            }
         }
         stateMachine = ControllerStateMachine(actions)
 
@@ -131,10 +158,21 @@ class MainActivity : ComponentActivity() {
             callStateMonitor.start()
         }
 
-        // Drive the state machine from RCM button events regardless of what's foregrounded.
+        // Drive the state machine from RCM button events. EXCEPTION: when the
+        // handlebar-gamepad is enabled AND OpenDash is in the background, the
+        // buttons belong to the accessibility gamepad (to control other apps) —
+        // so we must NOT also feed them to the media/menu state machine, or media
+        // would swallow Up/Down/Set and only Back would appear to work.
         lifecycleScope.launch {
             BccuConnectionService.buttonEvents.collect { button ->
                 try {
+                    val gamepadOwnsIt = settings.remoteMode == AppSettings.MODE_GAMEPAD &&
+                        !AppForegroundState.isForeground &&
+                        com.opendash.app.controller.RemoteControlAccessibilityService.isRunning
+                    if (gamepadOwnsIt) {
+                        AppLogger.log("Controller", "Button=$button -> gamepad mode (accessibility owns it)")
+                        return@collect
+                    }
                     AppLogger.log("Controller", "Button=$button screen=${stateMachine.screen} callRinging=${stateMachine.isCallRinging}")
                     stateMachine.onButton(button, System.currentTimeMillis(), NotificationRepository.entries.value.size)
                     AppLogger.log("Controller", "-> screen=${stateMachine.screen} gridSelection=${stateMachine.gridSelection}")
@@ -158,6 +196,23 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+
+        // Notification "Exit" pressed while this activity sits in the recents
+        // stack: the service can't finish us, so it broadcasts and we do.
+        finishReceiver = object : android.content.BroadcastReceiver() {
+            override fun onReceive(c: android.content.Context?, i: Intent?) {
+                finishAndRemoveTask()
+            }
+        }.also {
+            val filter = android.content.IntentFilter(BccuConnectionService.ACTION_FINISH_ACTIVITY)
+            if (Build.VERSION.SDK_INT >= 33) {
+                registerReceiver(it, filter, android.content.Context.RECEIVER_NOT_EXPORTED)
+            } else {
+                @Suppress("UnspecifiedRegisterReceiverFlag") registerReceiver(it, filter)
+            }
+        }
+
+        importGpxFromIntent(intent)
 
         setContent {
             OpenDashApp(settings = settings, stateMachine = stateMachine, actions = actions)
@@ -184,16 +239,55 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        importGpxFromIntent(intent)
+    }
+
+    /**
+     * ACTION_VIEW with a GPX: copy it into the routes folder (so it lives in
+     * the ride list permanently) and publish it for the UI to open. Sniffs the
+     * content because the octet-stream manifest filter matches non-GPX too.
+     */
+    private fun importGpxFromIntent(intent: Intent?) {
+        if (intent?.action != Intent.ACTION_VIEW) return
+        val uri = intent.data ?: return
+        runCatching {
+            val name = contentResolver.query(uri, null, null, null, null)?.use { c ->
+                val i = c.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                if (i >= 0 && c.moveToFirst()) c.getString(i) else null
+            } ?: uri.lastPathSegment ?: "imported_${System.currentTimeMillis()}.gpx"
+            val bytes = contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: return
+            val head = String(bytes, 0, minOf(bytes.size, 512))
+            if (!head.contains("<gpx", ignoreCase = true) && !name.endsWith(".gpx", ignoreCase = true)) {
+                AppLogger.log("Route", "Ignoring non-GPX ACTION_VIEW: $name")
+                return
+            }
+            val safe = name.replace(Regex("[^A-Za-z0-9._-]"), "_")
+                .let { if (it.endsWith(".gpx", ignoreCase = true)) it else "$it.gpx" }
+            val dest = java.io.File(com.opendash.app.location.RouteRecorder.routesDir(this), safe)
+            dest.writeBytes(bytes)
+            AppLogger.log("Route", "Imported GPX \"$name\" (${bytes.size / 1024} KB) -> ${dest.name}")
+            importedGpx.value = dest
+        }.onFailure { AppLogger.log("Route", "!! GPX import failed: $it") }
+    }
+
     private var maneuverExportReceiver: android.content.BroadcastReceiver? = null
+    private var finishReceiver: android.content.BroadcastReceiver? = null
 
     override fun onDestroy() {
         maneuverExportReceiver?.let { runCatching { unregisterReceiver(it) } }
+        finishReceiver?.let { runCatching { unregisterReceiver(it) } }
         super.onDestroy()
     }
 
     override fun onResume() {
         super.onResume()
         AppForegroundState.isForeground = true
+        // While visible we're eligible for while-in-use location even without
+        // background permission - let the service (re)claim the location FGS
+        // type and start any location features that were waiting on it.
+        BccuConnectionService.reevaluateLocationIfRunning()
     }
 
     override fun onPause() {
@@ -212,6 +306,10 @@ class MainActivity : ComponentActivity() {
         }
         perms += Manifest.permission.READ_PHONE_STATE
         perms += Manifest.permission.ANSWER_PHONE_CALLS
+        // GPS: overspeed alerts, waypoints, route recording. FINE alone is
+        // silently ignored on Android 12+; COARSE must be in the same request.
+        perms += Manifest.permission.ACCESS_FINE_LOCATION
+        perms += Manifest.permission.ACCESS_COARSE_LOCATION
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
             perms += Manifest.permission.WRITE_EXTERNAL_STORAGE
         }
@@ -228,11 +326,22 @@ private fun OpenDashApp(
     var route by remember {
         mutableStateOf(
             when {
+                MainActivity.importedGpx.value != null -> AppRoute.RIDES // opened a GPX from another app
+                !settings.brandChosen -> AppRoute.BRAND      // first run: pick the bike brand first
                 !settings.onboardingComplete -> AppRoute.ONBOARDING
                 settings.bondedDeviceAddress == null -> AppRoute.PAIRING
                 else -> AppRoute.MAIN
             }
         )
+    }
+    // Where "Change bike / brand" returns to: Settings when reached from there,
+    // null (forward-only to pairing) on first run.
+    var brandReturnRoute by remember { mutableStateOf<AppRoute?>(null) }
+    // A GPX arriving while we're already running (singleTask onNewIntent):
+    // jump to the ride viewer for it.
+    val importedGpx by MainActivity.importedGpx.collectAsState()
+    LaunchedEffect(importedGpx) {
+        if (importedGpx != null && route != AppRoute.ONBOARDING) route = AppRoute.RIDES
     }
     var logsReturnRoute by remember { mutableStateOf(AppRoute.SETTINGS) }
     val context = androidx.compose.ui.platform.LocalContext.current
@@ -243,13 +352,21 @@ private fun OpenDashApp(
     // Touch back navigation: sub-pages return to their parent instead of
     // minimizing the app (the physical RCM BACK still works independently).
     androidx.activity.compose.BackHandler(
-        enabled = route != AppRoute.PAIRING && route != AppRoute.ONBOARDING
+        enabled = route != AppRoute.PAIRING && route != AppRoute.ONBOARDING &&
+            !(route == AppRoute.BRAND && brandReturnRoute == null)
     ) {
         when (route) {
+            AppRoute.BRAND -> {
+                com.opendash.app.ui.theme.Ktm.applyBrand(settings.brand)
+                route = brandReturnRoute ?: AppRoute.MAIN
+                brandReturnRoute = null
+            }
             AppRoute.SETTINGS -> route = AppRoute.MAIN
             AppRoute.LOGS -> route = logsReturnRoute
             AppRoute.SYMBOL_TEST -> route = AppRoute.SETTINGS
             AppRoute.TURN_CALIBRATION -> route = AppRoute.SETTINGS
+            AppRoute.VIBRATION_CALIBRATION -> route = AppRoute.SETTINGS
+            AppRoute.RIDES -> { MainActivity.importedGpx.value = null; route = AppRoute.MAIN }
             AppRoute.MAIN -> if (!stateMachine.touchBack()) {
                 (context as? ComponentActivity)?.moveTaskToBack(true)
             }
@@ -277,6 +394,23 @@ private fun OpenDashApp(
     OpenDashTheme(highContrast = highContrast) {
       androidx.compose.foundation.layout.Box(modifier = androidx.compose.ui.Modifier.fillMaxSize()) {
         when (route) {
+            AppRoute.BRAND -> com.opendash.app.ui.screens.BrandSelectScreen(
+                onPair = { brand ->
+                    settings.brand = brand
+                    com.opendash.app.ui.theme.Ktm.applyBrand(brand)
+                    // From Settings → just return; on first run → continue setup.
+                    route = brandReturnRoute ?: if (!settings.onboardingComplete) AppRoute.ONBOARDING
+                        else if (settings.bondedDeviceAddress == null) AppRoute.PAIRING
+                        else AppRoute.MAIN
+                    brandReturnRoute = null
+                },
+                onBack = brandReturnRoute?.let { back -> {
+                    // Cancelled: revert live preview to the persisted brand.
+                    com.opendash.app.ui.theme.Ktm.applyBrand(settings.brand)
+                    route = back
+                    brandReturnRoute = null
+                } },
+            )
             AppRoute.ONBOARDING -> com.opendash.app.ui.screens.OnboardingScreen(
                 settings = settings,
                 onComplete = { route = AppRoute.PAIRING }
@@ -310,7 +444,8 @@ private fun OpenDashApp(
                             onSelectGrid = { index ->
                                 stateMachine.touchSelectGrid(index, System.currentTimeMillis())
                             },
-                            onOpenSettings = { route = AppRoute.SETTINGS }
+                            onOpenSettings = { route = AppRoute.SETTINGS },
+                            onOpenRides = { route = AppRoute.RIDES }
                         )
                     }
                 }
@@ -321,6 +456,9 @@ private fun OpenDashApp(
                 onOpenLogs = { logsReturnRoute = AppRoute.SETTINGS; route = AppRoute.LOGS },
                 onOpenSymbolTest = { route = AppRoute.SYMBOL_TEST },
                 onOpenTurnCalibration = { route = AppRoute.TURN_CALIBRATION },
+                onOpenVibrationCalibration = { route = AppRoute.VIBRATION_CALIBRATION },
+                onOpenRides = { route = AppRoute.RIDES },
+                onChangeBrand = { brandReturnRoute = AppRoute.SETTINGS; route = AppRoute.BRAND },
                 onRepair = {
                     // Forget the pairing flag too, not just the address - otherwise
                     // re-pairing the same bike still replies GENERATE_KEYS and the
@@ -342,6 +480,16 @@ private fun OpenDashApp(
             )
             AppRoute.TURN_CALIBRATION -> com.opendash.app.ui.screens.TurnCalibrationScreen(
                 onBack = { route = AppRoute.SETTINGS }
+            )
+            AppRoute.VIBRATION_CALIBRATION -> com.opendash.app.ui.screens.VibrationCalibrationScreen(
+                onBack = { route = AppRoute.SETTINGS }
+            )
+            AppRoute.RIDES -> com.opendash.app.ui.screens.RidesScreen(
+                initialFile = importedGpx,
+                onBack = {
+                    MainActivity.importedGpx.value = null
+                    route = AppRoute.MAIN
+                }
             )
         }
         if (showGreeting) {
@@ -369,12 +517,12 @@ private fun ConnectGreeting(name: String) {
             androidx.compose.material3.Icon(
                 painter = androidx.compose.ui.res.painterResource(com.opendash.app.R.drawable.dash_pedestrian),
                 contentDescription = null,
-                tint = com.opendash.app.ui.theme.Ktm.Screen,
+                tint = com.opendash.app.ui.theme.Ktm.OnAccent,
                 modifier = androidx.compose.ui.Modifier.size(34.dp),
             )
             androidx.compose.material3.Text(
                 text,
-                color = com.opendash.app.ui.theme.Ktm.Screen,
+                color = com.opendash.app.ui.theme.Ktm.OnAccent,
                 fontFamily = com.opendash.app.ui.theme.BarlowCondensed,
                 fontWeight = androidx.compose.ui.text.font.FontWeight.Bold,
                 fontStyle = androidx.compose.ui.text.font.FontStyle.Italic,

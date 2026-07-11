@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Navigation-arrow glyph, centered in the adaptive-icon safe zone. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <group
+        android:scaleX="2.1"
+        android:scaleY="2.1"
+        android:translateX="28.8"
+        android:translateY="28.8">
+        <path
+            android:fillColor="#FFFFFFFF"
+            android:pathData="M12,2 L4.5,20.29 L5.21,21 L12,18 L18.79,21 L19.5,20.29 Z" />
+    </group>
+</vector>

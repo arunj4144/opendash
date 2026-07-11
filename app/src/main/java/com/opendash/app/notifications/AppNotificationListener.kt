@@ -74,6 +74,17 @@ class AppNotificationListener : NotificationListenerService() {
             captureManeuverIconIfEnabled(sbn, title, text)
             val guessedIcon = TurnIconHeuristic.guessDirection(this, sbn)
             guessedIcon?.let { BccuConnectionService.sendTurnIconIfRunning(it) }
+            // Stereo approach beeps: left ear = left turn, right ear = right turn,
+            // faster pattern as the distance (the notification title) shrinks.
+            // Ducked to a background hum while the bike is provably waiting
+            // (GPS says stationary / vibration says the engine is off).
+            if (settings.turnBeepEnabled) {
+                com.opendash.app.audio.TurnBeeper.swapChannels = settings.swapBeepChannels
+                com.opendash.app.audio.TurnBeeper.volumePercent = settings.beepVolumePercent
+                com.opendash.app.audio.TurnBeeper.gpsSpeedKmh = com.opendash.app.location.SpeedMonitor.speedKmh.value
+                com.opendash.app.audio.TurnBeeper.engineOn = com.opendash.app.sensors.VibrationMonitor.engineOn.value
+                com.opendash.app.audio.TurnBeeper.onGuidance(title.ifBlank { null }, guessedIcon, text.ifBlank { null })
+            }
             NotificationRepository.updateNavGuidance(
                 NotificationRepository.NavGuidance(
                     distance = title.ifBlank { null },
@@ -88,6 +99,28 @@ class AppNotificationListener : NotificationListenerService() {
         }
 
         if (packageName !in settings.notificationSourceApps) return
+
+        // Only INDIVIDUAL conversations reach the dash: skip group chats
+        // (WhatsApp groups, group MMS) and the per-app summary notifications
+        // that just say "5 new messages".
+        val n = sbn.notification
+        if (n.flags and Notification.FLAG_GROUP_SUMMARY != 0) {
+            AppLogger.log("Notif", "Skipping group-summary notification from $packageName")
+            return
+        }
+        if (extras.getBoolean(Notification.EXTRA_IS_GROUP_CONVERSATION, false)) {
+            AppLogger.log("Notif", "Skipping GROUP conversation from $packageName: \"$title\"")
+            return
+        }
+        // WhatsApp fallback for older notification styles: group messages title
+        // as "Group name: Sender" or carry "@ Group" in the conversation title.
+        if (packageName == "com.whatsapp" &&
+            (extras.getCharSequence(Notification.EXTRA_CONVERSATION_TITLE) != null &&
+                extras.getBoolean(Notification.EXTRA_IS_GROUP_CONVERSATION, true))
+        ) {
+            AppLogger.log("Notif", "Skipping WhatsApp group (conversation title present): \"$title\"")
+            return
+        }
 
         val combined = if (title.isNotBlank()) "$title: $text" else text
         AppLogger.log("Notif", "Captured from $packageName ($appLabel): $combined")
@@ -175,6 +208,11 @@ class AppNotificationListener : NotificationListenerService() {
     override fun onNotificationRemoved(sbn: StatusBarNotification) {
         if (isNavigationNotification(sbn, AppSettings(this))) {
             AppLogger.log("Notif", "Nav notification removed from ${sbn.packageName} - scheduling guidance clear")
+            // TurnBeeper.reset() deliberately NOT called here: Maps routinely
+            // removes+reposts its notification mid-route, and resetting the beep
+            // dedup on every raw removal made the same turn beep again on each
+            // repost. The service's debounced clearGuidance() resets it instead,
+            // only when navigation has genuinely ended.
             BccuConnectionService.clearGuidanceIfRunning()
             NotificationRepository.clearNav()
         }

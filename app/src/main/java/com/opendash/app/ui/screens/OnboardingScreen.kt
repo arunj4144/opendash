@@ -79,13 +79,30 @@ import com.opendash.app.ui.theme.OpenDashIcons
  * scrollable so the layout survives small screens and short aspect ratios
  * without clipping the pinned action buttons.
  */
-private const val STEP_COUNT = 5
-private const val STEP_NAME = 3
+private const val STEP_COUNT = 6
+private const val STEP_NAME = 4
 
 @Composable
 fun OnboardingScreen(settings: AppSettings, onComplete: () -> Unit) {
     var step by remember { mutableIntStateOf(0) }
     var userName by remember { mutableStateOf(settings.userName ?: "") }
+
+    // "Skip all": one tap out of the whole wizard (R21 field request - after a
+    // reinstall everything is already granted and the walkthrough is friction).
+    // Still fires the runtime-permission request so a genuinely fresh install
+    // isn't left with a scan that can't run; the system returns instantly when
+    // everything is already granted. Completes regardless of the answer, same
+    // as the permission step's "Proceed anyway".
+    val skipPermLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) {
+        settings.onboardingComplete = true
+        onComplete()
+    }
+    val skipAll = {
+        settings.userName = userName
+        skipPermLauncher.launch(OpenDashPermissions.runtimePermissions())
+    }
 
     Column(
         modifier = Modifier
@@ -115,7 +132,7 @@ fun OnboardingScreen(settings: AppSettings, onComplete: () -> Unit) {
                 when (current) {
                     0 -> WelcomeStep(
                         onContinue = { step = 1 },
-                        onSkip = { step = STEP_NAME },
+                        onSkip = skipAll,
                     )
                     1 -> FeatureStep(
                         eyebrow = "Mirror",
@@ -125,7 +142,7 @@ fun OnboardingScreen(settings: AppSettings, onComplete: () -> Unit) {
                         illustration = { DashPreview() },
                         onContinue = { step = 2 },
                         onBack = { step = 0 },
-                        onSkip = { step = STEP_NAME },
+                        onSkip = skipAll,
                     )
                     2 -> FeatureStep(
                         eyebrow = "Handlebar remote",
@@ -133,15 +150,21 @@ fun OnboardingScreen(settings: AppSettings, onComplete: () -> Unit) {
                         body = "The four-button handlebar remote drives media, answers calls, and moves " +
                             "through the menu — completely hands-free while you ride.",
                         illustration = { RemotePreview() },
-                        onContinue = { step = STEP_NAME },
+                        onContinue = { step = 3 },
                         onBack = { step = 1 },
-                        onSkip = { step = STEP_NAME },
+                        onSkip = skipAll,
+                    )
+                    3 -> RideIntelligenceStep(
+                        settings = settings,
+                        onContinue = { step = STEP_NAME },
+                        onBack = { step = 2 },
+                        onSkip = skipAll,
                     )
                     STEP_NAME -> NameStep(
                         userName = userName,
                         onNameChange = { userName = it; settings.userName = it },
-                        onBack = { step = 2 },
-                        onContinue = { step = 4 },
+                        onBack = { step = 3 },
+                        onContinue = { step = 5 },
                     )
                     else -> PermissionsStep(
                         onBack = { step = STEP_NAME },
@@ -161,9 +184,9 @@ fun OnboardingScreen(settings: AppSettings, onComplete: () -> Unit) {
 @Composable
 private fun OnboardingHeader(step: Int) {
     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-        Text("OPEN", color = Ktm.White, fontFamily = BarlowCondensed,
+        Text("NAVIGATOR", color = Ktm.White, fontFamily = BarlowCondensed,
             fontWeight = FontWeight.Bold, fontStyle = FontStyle.Italic, fontSize = 22.sp)
-        Text("DASH", color = Ktm.Orange, fontFamily = BarlowCondensed,
+        Text("GEN3", color = Ktm.Orange, fontFamily = BarlowCondensed,
             fontWeight = FontWeight.Bold, fontStyle = FontStyle.Italic, fontSize = 22.sp)
         Spacer(Modifier.weight(1f))
         Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -206,7 +229,7 @@ private fun ColumnScope.WelcomeStep(onContinue: () -> Unit, onSkip: () -> Unit) 
         )
         Spacer(Modifier.height(14.dp))
         Text(
-            "OpenDash mirrors your notifications and navigation to the KTM dash, and turns " +
+            "Navigator Gen3 mirrors your notifications and navigation to the KTM dash, and turns " +
                 "the handlebar remote into a hands-free controller for your phone.",
             color = Ktm.Muted2, fontFamily = Barlow, fontSize = 15.sp, lineHeight = 22.sp,
         )
@@ -251,6 +274,73 @@ private fun ColumnScope.FeatureStep(
     IntroFooter(onBack = onBack, onSkip = onSkip)
 }
 
+/**
+ * Feature step 3: the riding brain - approach beeps, spoken turns, engine
+ * detection, and the GPX ride log - with the two opt-ins that matter up
+ * front (voice prompts, power saver) so the rider decides here rather than
+ * discovering them in Settings later.
+ */
+@Composable
+private fun ColumnScope.RideIntelligenceStep(
+    settings: AppSettings,
+    onContinue: () -> Unit,
+    onBack: () -> Unit,
+    onSkip: () -> Unit,
+) {
+    var powerSave by remember { mutableStateOf(settings.powerSaveEnabled) }
+    Column(
+        modifier = Modifier.weight(1f).verticalScroll(rememberScrollState()),
+    ) {
+        Eyebrow("Ride intelligence", color = Ktm.Orange, fontSize = 12, letterSpacing = 2.0)
+        Spacer(Modifier.height(8.dp))
+        Text(
+            "It listens,\nbeeps, and\nkeeps the log.",
+            color = Ktm.White, fontFamily = BarlowCondensed, fontWeight = FontWeight.Bold,
+            fontStyle = FontStyle.Italic, fontSize = 38.sp, lineHeight = 36.sp, letterSpacing = (-0.5).sp,
+        )
+        Spacer(Modifier.height(14.dp))
+        Text(
+            "Stereo beeps count you down to every turn (left ear = left turn) and go quiet when " +
+                "you're stopped. The phone's motion sensor learns your engine's rumble - calibrate " +
+                "it later from Settings - and every ride is saved as a GPX with a speed-colored map " +
+                "that knows traffic from a chai stop.",
+            color = Ktm.Muted2, fontFamily = Barlow, fontSize = 15.sp, lineHeight = 22.sp,
+        )
+        Spacer(Modifier.height(20.dp))
+        OnboardToggleCard(
+            title = "Power saver",
+            desc = "Full-rate GPS + sensors only while the phone is on bike power; gentle on battery otherwise. Turn off for full rate always.",
+            checked = powerSave,
+            onToggle = { powerSave = it; settings.powerSaveEnabled = it },
+        )
+    }
+    Spacer(Modifier.height(14.dp))
+    KtmPrimaryButton("Continue", onClick = onContinue)
+    IntroFooter(onBack = onBack, onSkip = onSkip)
+}
+
+@Composable
+private fun OnboardToggleCard(title: String, desc: String, checked: Boolean, onToggle: (Boolean) -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(Ktm.RadiusRow))
+            .background(Ktm.Surface)
+            .border(1.dp, if (checked) Ktm.ConnBorder else Ktm.Border, RoundedCornerShape(Ktm.RadiusRow))
+            .clickable { onToggle(!checked) }
+            .padding(14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
+            Text(title, color = Ktm.White, fontFamily = BarlowCondensed, fontWeight = FontWeight.Bold,
+                fontSize = 16.sp, letterSpacing = 0.3.sp)
+            Text(desc, color = Ktm.Dim, fontFamily = Barlow, fontSize = 12.5.sp, lineHeight = 17.sp,
+                modifier = Modifier.padding(top = 2.dp))
+        }
+        com.opendash.app.ui.components.KtmToggle(checked, onToggle)
+    }
+}
+
 /** Back (left) + Skip (right) row shared by the intro steps. */
 @Composable
 private fun IntroFooter(onBack: (() -> Unit)?, onSkip: (() -> Unit)?) {
@@ -268,7 +358,7 @@ private fun IntroFooter(onBack: (() -> Unit)?, onSkip: (() -> Unit)?) {
         Spacer(Modifier.weight(1f))
         if (onSkip != null) {
             Text(
-                "Skip intro", color = Ktm.Dim, fontFamily = Barlow, fontSize = 13.sp,
+                "Skip all", color = Ktm.Dim, fontFamily = Barlow, fontSize = 13.sp,
                 modifier = Modifier.clickable(onClick = onSkip).padding(8.dp),
             )
         }
@@ -488,7 +578,7 @@ private fun ColumnScope.PermissionsStep(
     )
     Spacer(Modifier.height(6.dp))
     Text(
-        "OpenDash needs these to talk to your bike. Nothing leaves your phone.",
+        "Navigator Gen3 needs these to talk to your bike. Nothing leaves your phone.",
         color = Ktm.Muted2, fontFamily = Barlow, fontSize = 14.sp, lineHeight = 20.sp,
     )
 

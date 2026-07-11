@@ -1,9 +1,9 @@
 package com.opendash.app.ui.theme
 
 import android.app.Activity
-import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
+import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.SideEffect
 import androidx.compose.ui.graphics.Color
@@ -11,55 +11,62 @@ import androidx.compose.ui.platform.LocalView
 import androidx.core.view.WindowCompat
 
 /**
- * KTM-inspired always-dark theme: signature orange (#FF6600) on near-black.
- * The whole app is dark by design (glanceable in sunlight, motorsport look),
- * so there is no light variant. The Notifications screen switches to pure
- * black via [highContrast] for maximum outdoor legibility.
+ * Brand-driven theme. The app re-skins per motorcycle brand (see [Ktm]/[BrandTheme]);
+ * KTM is dark (orange on near-black), Husqvarna is light (blue on white). The
+ * Material colorScheme and the system bar appearance are both derived from the
+ * live [Ktm.current] theme, so switching brand recolours everything. The
+ * Notifications screen still switches to a max-contrast background via
+ * [highContrast] for outdoor legibility (pure black on dark, white on light).
  */
-private val KtmColorScheme = darkColorScheme(
-    primary = Ktm.Orange,
-    onPrimary = Ktm.Screen,
-    secondary = Ktm.Orange,
-    tertiary = Ktm.Green,
-    background = Ktm.Screen,
-    onBackground = Ktm.White,
-    surface = Ktm.Surface,
-    onSurface = Ktm.TextPrimary,
-    surfaceVariant = Ktm.Surface,
-    onSurfaceVariant = Ktm.TextSecondary,
-    primaryContainer = Ktm.Orange,
-    onPrimaryContainer = Ktm.Screen,
-    outline = Ktm.Border,
-    error = Ktm.Danger,
-    onError = Ktm.White,
-    errorContainer = Color(0xFF3A1512),
-    onErrorContainer = Ktm.TextPrimary,
-)
-
-private val KtmHighContrastScheme = KtmColorScheme.copy(
-    background = Ktm.Black,
-    surface = Ktm.Black,
-    onBackground = Ktm.White,
-    onSurface = Ktm.White,
-)
+private fun schemeFor(t: BrandTheme) = if (t.isDark) {
+    darkColorScheme(
+        primary = t.accent, onPrimary = t.onAccent,
+        secondary = t.accent, tertiary = t.green,
+        background = t.screen, onBackground = t.head,
+        surface = t.surface, onSurface = t.textPrimary,
+        surfaceVariant = t.surface, onSurfaceVariant = t.textSecondary,
+        primaryContainer = t.accent, onPrimaryContainer = t.onAccent,
+        outline = t.border, error = t.danger, onError = t.onAccent,
+        errorContainer = Color(0xFF3A1512), onErrorContainer = t.textPrimary,
+    )
+} else {
+    lightColorScheme(
+        primary = t.accent, onPrimary = t.onAccent,
+        secondary = t.accent, tertiary = t.green,
+        background = t.screen, onBackground = t.head,
+        surface = t.surface, onSurface = t.textPrimary,
+        surfaceVariant = t.surfaceAlt, onSurfaceVariant = t.textSecondary,
+        primaryContainer = t.accent, onPrimaryContainer = t.onAccent,
+        outline = t.border, error = t.danger, onError = Color(0xFFFFFFFF),
+        errorContainer = Color(0xFFF7D9D6), onErrorContainer = t.textPrimary,
+    )
+}
 
 @Composable
 fun OpenDashTheme(
-    darkTheme: Boolean = isSystemInDarkTheme(),
     highContrast: Boolean = false,
     content: @Composable () -> Unit
 ) {
-    val colorScheme = if (highContrast) KtmHighContrastScheme else KtmColorScheme
+    val theme = Ktm.current // reactive: recomposes on brand switch
+    var colorScheme = schemeFor(theme)
+    if (highContrast) {
+        colorScheme = colorScheme.copy(
+            background = theme.black, surface = theme.black,
+            onBackground = theme.head, onSurface = theme.head,
+        )
+    }
 
     val view = LocalView.current
     if (!view.isInEditMode) {
         SideEffect {
             val window = (view.context as? Activity)?.window ?: return@SideEffect
             window.statusBarColor = Color.Transparent.value.toInt()
-            window.navigationBarColor = (if (highContrast) Ktm.Black else Ktm.Screen).value.toInt()
+            window.navigationBarColor =
+                (if (highContrast) theme.black else theme.screen).value.toInt()
+            // Light theme needs DARK system-bar icons; dark theme needs light.
             WindowCompat.getInsetsController(window, view).apply {
-                isAppearanceLightStatusBars = false
-                isAppearanceLightNavigationBars = false
+                isAppearanceLightStatusBars = !theme.isDark
+                isAppearanceLightNavigationBars = !theme.isDark
             }
         }
     }

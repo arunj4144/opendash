@@ -1,5 +1,14 @@
 import java.text.SimpleDateFormat
 import java.util.Date
+import java.util.Properties
+
+// Release signing credentials live in local.properties (gitignored) so the
+// keystore identity stays stable across builds - a consistent, non-debug
+// signature is what keeps Play Protect from hard-blocking sideloaded installs.
+val localProps = Properties().apply {
+    val f = rootProject.file("local.properties")
+    if (f.exists()) f.inputStream().use { load(it) }
+}
 
 plugins {
     id("com.android.application")
@@ -14,15 +23,35 @@ android {
         applicationId = "com.opendash.app"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        // Timestamped so it's easy to confirm which build is actually
-        // installed on-device (Settings > Diagnostics shows this).
-        versionName = "0.1-" + SimpleDateFormat("MMdd-HHmm").format(Date())
+        // Days-since-epoch: monotonically increasing across builds, so every
+        // new APK is a clean in-place update (Play Protect also treats a
+        // never-incrementing versionCode as a suspicion signal).
+        versionCode = (System.currentTimeMillis() / 86_400_000L).toInt()
+        // Public beta line, with a build stamp appended so it's easy to confirm
+        // which build is actually installed on-device (Settings > Diagnostics).
+        versionName = "0.2.0-beta+" + SimpleDateFormat("MMdd-HHmm").format(Date())
+    }
+
+    signingConfigs {
+        create("release") {
+            localProps.getProperty("RELEASE_STORE_FILE")?.let { path ->
+                storeFile = file(path)
+                storePassword = localProps.getProperty("RELEASE_STORE_PASSWORD")
+                keyAlias = localProps.getProperty("RELEASE_KEY_ALIAS")
+                keyPassword = localProps.getProperty("RELEASE_KEY_PASSWORD")
+            }
+        }
     }
 
     buildTypes {
         debug {
             isMinifyEnabled = false
+        }
+        release {
+            // No minification: TFLite + reflection-heavy BLE code isn't worth
+            // proguard risk for a sideloaded app; signing is what matters here.
+            isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("release")
         }
     }
 

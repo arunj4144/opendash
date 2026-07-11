@@ -61,14 +61,33 @@ class BccuConnectionService : LifecycleService() {
         /** How long the "Hi <name>!" connect greeting stays on the center display before clearing. */
         private const val GREETING_MS = 6000L
         /**
-         * If a handshake doesn't reach AUTHENTICATED within this long, assume the
-         * dash has lost its side of the pairing (we keep replying GENERATE_KEYS to
-         * a dash that no longer knows us → stuck at "handshaking"). Auto-recover by
-         * forgetting the pairing and reconnecting, which re-does a fresh HELLO so
-         * the dash shows its "add device" prompt - no data-wipe / manual re-pair.
+         * If a handshake doesn't reach AUTHENTICATED within this long, drop the
+         * link and re-scan. Armed at LINK-UP (not on m1): a reused/zombie ACL
+         * never re-sends m1, so an m1-armed timer can leave a silent connection
+         * unguarded forever (field log 20260709_173524, 19:17:15). A bonded dash
+         * finishes the whole handshake in ~3s and kicks unauthenticated links
+         * itself at ~15s, so 25s means "dead or dash still booting - recycle".
+         * A genuine first pairing includes the rider physically confirming the
+         * "add device" prompt on the dash (~30s in field logs), so it gets a
+         * much longer budget. We never clear the pairing here (see the
+         * cmd=HELLO handler: the dash owns the prompt decision, not us).
          */
-        private const val HANDSHAKE_TIMEOUT_MS = 18_000L
-        private const val MAX_HANDSHAKE_RECOVERIES = 2
+        private const val HANDSHAKE_TIMEOUT_KNOWN_MS = 25_000L
+        private const val HANDSHAKE_TIMEOUT_FIRST_PAIR_MS = 75_000L
+        /**
+         * Grace between SEEING the bike advertise and actually connecting. The
+         * dash's radio wakes well before its pairing manager after ignition-on;
+         * connecting into that gap stalls the handshake and - hammered
+         * repeatedly - can push the dash into re-showing its "add device"
+         * prompt (R21 field report). Ten seconds of settling lets the dash
+         * finish waking before our first attempt.
+         */
+        private const val CONNECT_SETTLE_MS = 10_000L
+        /** Cooldown before rescanning after a stalled handshake: one quickish retry, then hang back. */
+        private const val RETRY_COOLDOWN_FIRST_MS = 15_000L
+        private const val RETRY_COOLDOWN_LATER_MS = 45_000L
+        /** Three Up presses within this window open the handlebar mode-picker overlay. */
+        private const val TRIPLE_UP_WINDOW_MS = 1500L
         /** How often the reconnect watchdog checks that we're linked (or retries). */
         private const val RECONNECT_WATCHDOG_MS = 20_000L
         /** A foreground (direct) connect attempt stuck this long is recycled and retried. */
@@ -129,6 +148,31 @@ class BccuConnectionService : LifecycleService() {
             runningInstance?.sendNotification(text, icon)
         }
 
+        /** Low-priority live status (overspeed readout): yields to any message currently on the banner. */
+        fun sendSpeedBannerIfRunning(text: String) {
+            runningInstance?.sendSpeedBanner(text)
+        }
+
+        /** Re-check the route-recording gate (setting toggled from the UI). */
+        fun reevaluateRouteRecordingIfRunning() {
+            runningInstance?.routeRecorder?.reevaluate()
+        }
+
+        /** Re-check location permission-dependent features (permission granted / app foregrounded). */
+        fun reevaluateLocationIfRunning() {
+            runningInstance?.reevaluateLocationFeatures()
+        }
+
+        /** Engine-vibration detection was toggled or recalibrated: restart it with fresh thresholds. */
+        fun reevaluateEngineDetectIfRunning() {
+            runningInstance?.vibrationMonitor?.reevaluate()
+        }
+
+        /** Notification action: fully quit - stop the service, drop notifications, close the app task. */
+        const val ACTION_EXIT = "com.opendash.app.action.EXIT"
+        /** Broadcast the running MainActivity listens for to finish its task on notification-exit. */
+        const val ACTION_FINISH_ACTIVITY = "com.opendash.app.action.FINISH_ACTIVITY"
+
         fun sendTurnIconIfRunning(icon: BccuProtocol.TurnIcon) {
             runningInstance?.sendTurnIcon(icon)
         }
@@ -164,13 +208,30 @@ class BccuConnectionService : LifecycleService() {
     private var reconnectWatchdogJob: Job? = null
     private var handshakeTimeoutJob: Job? = null
     private var handshakeRecoveries: Int = 0
+    /** Pending scan-found -> connect delay (dash boot grace); active means "we will connect shortly". */
+    private var settleJob: Job? = null
+    private var scanCallback: android.bluetooth.le.ScanCallback? = null
+    @Volatile private var scanning: Boolean = false
+    @Volatile private var scanTargetAddress: String? = null
+    private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private var modeOverlay: com.opendash.app.controller.RemoteModeOverlay? = null
+    private val upPressTimes = ArrayDeque<Long>()
 
     private var prpcAvailable = false
     private var telemetrySchema: List<Datapoint>? = null
     private var telemetrySid: Int = 0
     private fun nextSid(): Int { telemetrySid = (telemetrySid + 1) and 0xFF; return telemetrySid }
 
-    private val gattQueue = ArrayDeque<() -> Unit>()
+    // Guarded by gattQueueLock: ops are enqueued/finished on BLE binder threads
+    // while teardown paths (adapter-off receiver, watchdog, handshake recovery)
+    // clear the queue from the main thread - ArrayDeque is not thread-safe.
+    // coalesceKey: non-null marks a "latest value wins" write (guidance labels,
+    // marquee frames, banner) - enqueueing drops any still-pending write with
+    // the same key, so a degraded link can never build an unbounded backlog of
+    // stale frames. Control-plane ops (auth, CCCD, PRPC requests) keep null.
+    private class GattOp(val coalesceKey: java.util.UUID?, val run: () -> Unit)
+    private val gattQueueLock = Any()
+    private val gattQueue = ArrayDeque<GattOp>()
     private var gattBusy = false
 
     private var connectingSinceMs: Long = 0L
@@ -179,9 +240,126 @@ class BccuConnectionService : LifecycleService() {
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
-        startForeground(NOTIFICATION_ID, buildForegroundNotification("Connecting..."))
+        startForegroundWithTypes("Connecting...")
         runningInstance = this
         startReconnectWatchdog()
+        registerAdapterStateReceiver()
+        speedMonitor = com.opendash.app.location.SpeedMonitor(this).also { it.start() }
+        routeRecorder = com.opendash.app.location.RouteRecorder(this).also { it.start() }
+        vibrationMonitor = com.opendash.app.sensors.VibrationMonitor(this).also { it.start() }
+        // Keep the live movement signals flowing to their consumers continuously,
+        // not just when a guidance update happens to arrive: the beeper's
+        // stationary duck and the GPX engine trace both read these.
+        lifecycleScope.launch {
+            com.opendash.app.location.SpeedMonitor.speedKmh.collect { kmh ->
+                vibrationMonitor?.currentSpeedKmh = kmh
+                com.opendash.app.audio.TurnBeeper.gpsSpeedKmh = kmh
+            }
+        }
+        lifecycleScope.launch {
+            com.opendash.app.sensors.VibrationMonitor.engineOn.collect { on ->
+                com.opendash.app.audio.TurnBeeper.engineOn = on
+                routeRecorder?.onEngineState(on)
+            }
+        }
+        // Debug-only: `adb shell am broadcast -a com.opendash.app.DEBUG_MODE_OVERLAY`
+        // shows the handlebar mode picker without a bike, to verify it renders.
+        if (com.opendash.app.BuildConfig.DEBUG) {
+            val r = object : android.content.BroadcastReceiver() {
+                override fun onReceive(c: Context?, i: Intent?) { showModeOverlay() }
+            }
+            val f = android.content.IntentFilter("com.opendash.app.DEBUG_MODE_OVERLAY")
+            if (Build.VERSION.SDK_INT >= 33) registerReceiver(r, f, Context.RECEIVER_EXPORTED)
+            else @Suppress("UnspecifiedRegisterReceiverFlag") registerReceiver(r, f)
+        }
+    }
+
+    private var adapterStateReceiver: android.content.BroadcastReceiver? = null
+    private var speedMonitor: com.opendash.app.location.SpeedMonitor? = null
+    private var routeRecorder: com.opendash.app.location.RouteRecorder? = null
+    var vibrationMonitor: com.opendash.app.sensors.VibrationMonitor? = null
+        private set
+
+    /**
+     * Explicit FGS types (API 34 enforces them): connectedDevice always;
+     * location only when the permission is actually granted AND we're eligible
+     * to use it (app visible, or "allow all the time" granted) - defaulting to
+     * the manifest types would throw SecurityException on a fresh install where
+     * the boot/ACL receiver starts us before the rider grants location.
+     * Safe to call again later to UPGRADE the type once permissions arrive.
+     */
+    private fun startForegroundWithTypes(status: String) {
+        val fgsType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            var t = android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+            val fine = androidx.core.content.ContextCompat.checkSelfPermission(
+                this, android.Manifest.permission.ACCESS_FINE_LOCATION
+            ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+            val background = androidx.core.content.ContextCompat.checkSelfPermission(
+                this, android.Manifest.permission.ACCESS_BACKGROUND_LOCATION
+            ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+            if (fine && (background || AppForegroundState.isForeground)) {
+                t = t or android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
+            }
+            t
+        } else 0
+        androidx.core.app.ServiceCompat.startForeground(
+            this, NOTIFICATION_ID, buildForegroundNotification(status), fgsType
+        )
+    }
+
+    /**
+     * Re-check location-dependent features: called when the app comes to the
+     * foreground or a permission was just granted. Location permission is often
+     * granted AFTER this long-lived service started (the permission dialog is
+     * async), which used to leave the speed monitor dead and the FGS without
+     * the location type until the next reboot.
+     */
+    private fun reevaluateLocationFeatures() {
+        runCatching { startForegroundWithTypes(statusText) }
+        speedMonitor?.start()
+        routeRecorder?.reevaluate()
+    }
+
+    private var statusText: String = "Connecting..."
+
+    /**
+     * Android does NOT reliably deliver onConnectionStateChange when the LOCAL
+     * adapter is switched off (unlike an out-of-range drop) - field log
+     * opendash_log_20260709_004422 showed the app stuck on "Connected" forever
+     * after the rider toggled Bluetooth off. Observe the adapter state directly:
+     * on OFF force-disconnect and show it; on ON resume the scan-to-reconnect
+     * path immediately (the manifest AutoConnectReceiver also covers the case
+     * where this service isn't running).
+     */
+    private fun registerAdapterStateReceiver() {
+        val r = object : android.content.BroadcastReceiver() {
+            override fun onReceive(c: Context?, i: Intent?) {
+                when (i?.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)) {
+                    BluetoothAdapter.STATE_TURNING_OFF, BluetoothAdapter.STATE_OFF -> {
+                        AppLogger.log("BLE", "Bluetooth adapter turned OFF - forcing disconnect state")
+                        stopBleScan()
+                        settleJob?.cancel(); settleJob = null
+                        try { gatt?.disconnect(); gatt?.close() } catch (e: Exception) { /* stack is going down anyway */ }
+                        gatt = null
+                        rssiJob?.cancel(); rssiJob = null
+                        handshakeTimeoutJob?.cancel(); handshakeTimeoutJob = null
+                        tempIv = null; tempSecret = null; sessionKeys = null; activeSessionKey = null
+                        clearGattQueue()
+                        _signalRssi.value = null
+                        _connectionState.value = ConnectionState.DISCONNECTED
+                        updateForegroundNotification("Bluetooth is off")
+                    }
+                    BluetoothAdapter.STATE_ON -> {
+                        AppLogger.log("BLE", "Bluetooth adapter turned ON - resuming reconnect scan")
+                        updateForegroundNotification("Reconnecting…")
+                        val addr = AppSettings(this@BccuConnectionService).bondedDeviceAddress
+                        if (addr != null && gatt == null) startBleScan(addr)
+                    }
+                }
+            }
+        }
+        registerReceiver(r, android.content.IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED))
+        adapterStateReceiver = r
     }
 
     /**
@@ -203,30 +381,40 @@ class BccuConnectionService : LifecycleService() {
                     val adapter = (getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter
                     if (adapter == null || !adapter.isEnabled) continue
                     if (gatt == null) {
-                        AppLogger.log("BLE", "Watchdog: not connected and no GATT in flight, retrying connect")
-                        connect(address, autoConnect = true)
-                    } else if (_connectionState.value == ConnectionState.CONNECTING) {
-                        // A stuck CONNECTING state must be recovered even for a
-                        // background (autoConnect=true) attempt: connectGatt(true)
-                        // is documented to relink on its own, but on real hardware
-                        // it can silently NEVER fire (observed: stuck >1h after the
-                        // bike dropped and came back). A handshake only takes a few
-                        // seconds, so anything stuck this long is dead, not mid-auth.
-                        // Foreground (direct) attempts get the shorter timeout;
-                        // background ones a longer grace before we churn the radio.
-                        val elapsed = System.currentTimeMillis() - connectingSinceMs
-                        val limit = if (pendingAutoConnect) STUCK_BACKGROUND_MS else STUCK_CONNECTING_MS
-                        if (elapsed > limit) {
-                            AppLogger.log("BLE", "Watchdog: stuck connecting ${elapsed}ms (bg=$pendingAutoConnect, limit=$limit) - recycling GATT and forcing a direct connect")
-                            try { gatt?.disconnect(); gatt?.close() } catch (e: Exception) { /* ignore */ }
-                            gatt = null
-                            // Force a DIRECT (autoConnect=false) attempt: it actively
-                            // scans/links now instead of waiting on the stalled
-                            // background request. On failure, onConnectionStateChange
-                            // schedules a fresh autoConnect, so the two alternate
-                            // rather than dead-locking.
-                            connect(address, autoConnect = false)
+                        // Not linked and nothing in flight: make sure we're scanning
+                        // for the bike so we grab it the moment it advertises. A
+                        // pending settle delay or retry cooldown counts as in
+                        // flight - restarting the scan would cut the pacing short.
+                        if (!scanning && settleJob?.isActive != true && handshakeTimeoutJob?.isActive != true) {
+                            AppLogger.log("BLE", "Watchdog: not connected - (re)starting scan")
+                            startBleScan(address)
                         }
+                    } else if (_connectionState.value == ConnectionState.CONNECTING &&
+                        System.currentTimeMillis() - connectingSinceMs > STUCK_CONNECTING_MS
+                    ) {
+                        if (tempIv != null && !AppSettings(this@BccuConnectionService).hasPairedBefore(address)) {
+                            // A FIRST-pair handshake is genuinely in progress (m1
+                            // arrived) - the rider may be confirming the "add
+                            // device" prompt on the dash, which takes >45s. The
+                            // long first-pair handshake timeout owns that recovery;
+                            // recycling here would tear the link mid-confirm. A
+                            // KNOWN bike never legitimately waits this long (its
+                            // 25s handshake timer fires first), so it falls through.
+                            continue
+                        }
+                        // A direct connect that's been hung too long is dead - recycle
+                        // the GATT and fall back to scanning (which reconnects when the
+                        // dash is actually reachable, avoiding the status-255 churn).
+                        // Clear the op queue and any leftover crypto too: a lost
+                        // in-flight op would otherwise leave gattBusy stuck true and
+                        // stall every op on the NEXT connection forever.
+                        AppLogger.log("BLE", "Watchdog: connect stuck >${STUCK_CONNECTING_MS}ms - recycling + scanning")
+                        try { gatt?.disconnect(); gatt?.close() } catch (e: Exception) { /* ignore */ }
+                        gatt = null
+                        clearGattQueue()
+                        handshakeTimeoutJob?.cancel(); handshakeTimeoutJob = null
+                        tempIv = null; tempSecret = null; sessionKeys = null; activeSessionKey = null
+                        startBleScan(address)
                     }
                 } catch (e: Exception) {
                     AppLogger.log("BLE", "!! Watchdog iteration threw: $e")
@@ -235,8 +423,83 @@ class BccuConnectionService : LifecycleService() {
         }
     }
 
+    /**
+     * Actively scan for the bonded bike and connect the instant it advertises.
+     * More reliable than connectGatt(autoConnect=true), which was observed to
+     * silently never relink on real phones. Matches the target by MAC (the same
+     * device the phone is already bonded/paired with for media), so it also
+     * covers "the bike is already saved on my phone". Low-power scan; stops as
+     * soon as the device is found or we authenticate.
+     */
+    @SuppressLint("MissingPermission")
+    private fun startBleScan(address: String) {
+        if (scanning) return
+        val adapter = (getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter
+        val scanner = adapter?.bluetoothLeScanner
+        if (adapter == null || !adapter.isEnabled || scanner == null) {
+            AppLogger.log("BLE", "Scan: adapter/scanner unavailable, deferring")
+            return
+        }
+        val target = address.uppercase()
+        val cb = object : android.bluetooth.le.ScanCallback() {
+            override fun onScanResult(callbackType: Int, result: android.bluetooth.le.ScanResult) {
+                val dev = result.device ?: return
+                if (dev.address?.uppercase() != target) return
+                AppLogger.log("BLE", "Scan: found bike ${dev.address} (rssi=${result.rssi}) - settling ${CONNECT_SETTLE_MS / 1000}s before connect (dash boot grace)")
+                stopBleScan()
+                if (gatt != null || settleJob?.isActive == true) return
+                settleJob = lifecycleScope.launch {
+                    delay(CONNECT_SETTLE_MS)
+                    if (gatt == null) connect(target, autoConnect = false)
+                }
+            }
+            override fun onScanFailed(errorCode: Int) {
+                AppLogger.log("BLE", "!! Scan failed: $errorCode")
+                scanning = false
+            }
+        }
+        val filters = listOf(
+            android.bluetooth.le.ScanFilter.Builder().setDeviceAddress(address).build()
+        )
+        val settings = android.bluetooth.le.ScanSettings.Builder()
+            .setScanMode(android.bluetooth.le.ScanSettings.SCAN_MODE_LOW_LATENCY)
+            .build()
+        try {
+            scanner.startScan(filters, settings, cb)
+            scanCallback = cb
+            scanTargetAddress = target
+            scanning = true
+            _connectionState.value = ConnectionState.CONNECTING
+            AppLogger.log("BLE", "Scanning for bike $address to reconnect")
+        } catch (e: Exception) {
+            AppLogger.log("BLE", "!! startScan threw: $e")
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun stopBleScan() {
+        if (!scanning) return
+        scanning = false
+        scanTargetAddress = null
+        try {
+            val adapter = (getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter
+            scanCallback?.let { adapter?.bluetoothLeScanner?.stopScan(it) }
+        } catch (e: Exception) { /* ignore */ }
+        scanCallback = null
+    }
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         super.onStartCommand(intent, flags, startId)
+        if (intent?.action == ACTION_EXIT) {
+            AppLogger.log("BLE", "Exit requested from the notification - shutting down")
+            // Ask the (possibly backgrounded) activity to remove its task, drop
+            // every notification we own, and stop - onDestroy tears the rest down.
+            sendBroadcast(Intent(ACTION_FINISH_ACTIVITY).setPackage(packageName))
+            runCatching { getSystemService(NotificationManager::class.java).cancelAll() }
+            androidx.core.app.ServiceCompat.stopForeground(this, androidx.core.app.ServiceCompat.STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            return START_NOT_STICKY
+        }
         val address = intent?.getStringExtra(EXTRA_DEVICE_ADDRESS) ?: AppSettings(this).bondedDeviceAddress
         if (address != null) {
             connect(address)
@@ -252,6 +515,15 @@ class BccuConnectionService : LifecycleService() {
      */
     private fun connect(address: String, autoConnect: Boolean = false) {
         if (gatt != null) return
+        // Already scanning for this same bike (e.g. the in-service adapter-ON
+        // handler races AutoConnectReceiver's onStartCommand): let the scan win.
+        // A blind direct connect while the bike is off just churns status-255
+        // failures - the scan-first design exists precisely to avoid that.
+        if (scanning && address.equals(scanTargetAddress, ignoreCase = true)) {
+            AppLogger.log("BLE", "connect($address) skipped - scan already hunting for it")
+            return
+        }
+        if (scanning) stopBleScan()
         AppLogger.log("BLE", "Connecting to $address (autoConnect=$autoConnect)")
         currentDeviceAddress = address
         _connectionState.value = ConnectionState.CONNECTING
@@ -272,6 +544,14 @@ class BccuConnectionService : LifecycleService() {
 
     override fun onDestroy() {
         AppLogger.log("BLE", "Service destroyed")
+        adapterStateReceiver?.let { runCatching { unregisterReceiver(it) } }
+        adapterStateReceiver = null
+        speedMonitor?.stop(); speedMonitor = null
+        routeRecorder?.stop(); routeRecorder = null
+        vibrationMonitor?.destroy(); vibrationMonitor = null
+        stopBleScan()
+        settleJob?.cancel(); settleJob = null
+        mainHandler.post { modeOverlay?.hide(); modeOverlay = null }
         reconnectWatchdogJob?.cancel(); reconnectWatchdogJob = null
         gatt?.disconnect()
         gatt?.close()
@@ -302,37 +582,62 @@ class BccuConnectionService : LifecycleService() {
         val pendingIntent = packageManager.getLaunchIntentForPackage(packageName)?.let {
             PendingIntent.getActivity(this, 0, it, PendingIntent.FLAG_IMMUTABLE)
         }
+        // A real way out from the notification: stops this service (removing
+        // the ongoing notification) and closes the app task - the R20 field
+        // request was an exit that actually exits, not just opens the app.
+        val exitIntent = PendingIntent.getService(
+            this, 1,
+            Intent(this, BccuConnectionService::class.java).setAction(ACTION_EXIT),
+            PendingIntent.FLAG_IMMUTABLE
+        )
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("OpenDash")
+            .setContentTitle("Navigator Gen3")
             .setContentText(status)
             .setSmallIcon(R.drawable.ic_notification)
             .setOngoing(true)
             .setContentIntent(pendingIntent)
+            .addAction(0, "Exit", exitIntent)
             .build()
     }
 
     private fun updateForegroundNotification(status: String) {
+        statusText = status
         val manager = getSystemService(NotificationManager::class.java)
         manager.notify(NOTIFICATION_ID, buildForegroundNotification(status))
     }
 
     // --- Serial GATT operation queue (Android allows only one outstanding op at a time) ---
 
-    private fun enqueueGattOp(op: () -> Unit) {
-        gattQueue.addLast(op)
+    private fun enqueueGattOp(coalesceKey: java.util.UUID? = null, op: () -> Unit) {
+        synchronized(gattQueueLock) {
+            if (coalesceKey != null) {
+                gattQueue.removeAll { it.coalesceKey == coalesceKey }
+            }
+            gattQueue.addLast(GattOp(coalesceKey, op))
+        }
         runNextGattOp()
     }
 
     private fun runNextGattOp() {
-        if (gattBusy) return
-        val next = gattQueue.pollFirst() ?: return
-        gattBusy = true
-        next()
+        val next = synchronized(gattQueueLock) {
+            if (gattBusy) return
+            val op = gattQueue.pollFirst() ?: return
+            gattBusy = true
+            op
+        }
+        next.run()
     }
 
     private fun gattOpFinished() {
-        gattBusy = false
+        synchronized(gattQueueLock) { gattBusy = false }
         runNextGattOp()
+    }
+
+    private fun clearGattQueue() {
+        synchronized(gattQueueLock) {
+            gattQueue.clear()
+            gattBusy = false
+        }
     }
 
     /**
@@ -347,32 +652,47 @@ class BccuConnectionService : LifecycleService() {
         override fun onConnectionStateChange(g: BluetoothGatt, status: Int, newState: Int) {
             try {
                 AppLogger.log("BLE", "onConnectionStateChange status=$status newState=$newState")
+                // A late callback from a client we already recycled (adapter-off
+                // teardown, stuck-connect recycle, handshake recovery) must not
+                // clobber the CURRENT connection's state - just release it.
+                if (g !== gatt) {
+                    AppLogger.log("BLE", "Ignoring state change from a stale GATT client")
+                    try { g.close() } catch (e: Exception) { /* already gone */ }
+                    return
+                }
                 if (newState == BluetoothGatt.STATE_CONNECTED) {
+                    // Arm the handshake watchdog NOW, not when m1 arrives: a link
+                    // where the BCCU never restarts auth (reused ACL) would
+                    // otherwise sit silent with no timer guarding it at all.
+                    startHandshakeTimeout()
                     g.discoverServices()
                 } else if (newState == BluetoothGatt.STATE_DISCONNECTED) {
+                    // An AUTHENTICATED session ending (ignition off, out of
+                    // range) closes this boot cycle - the next one deserves a
+                    // fresh retry budget, not leftovers from the last stall.
+                    if (_connectionState.value == ConnectionState.AUTHENTICATED) handshakeRecoveries = 0
                     _connectionState.value = ConnectionState.DISCONNECTED
                     _signalRssi.value = null
                     rssiJob?.cancel(); rssiJob = null
                     handshakeTimeoutJob?.cancel(); handshakeTimeoutJob = null
                     tempIv = null; tempSecret = null; sessionKeys = null; activeSessionKey = null
-                    gattQueue.clear(); gattBusy = false
+                    clearGattQueue()
                     // Release the old GATT client fully before requesting a new
                     // one - reusing a disconnected BluetoothGatt is a known source
                     // of silent reconnect failures (status 133).
                     try { g.close() } catch (e: Exception) { /* already gone */ }
                     gatt = null
                     updateForegroundNotification("Reconnecting…")
-                    // Reconnect with autoConnect=true so Android re-links on its
-                    // own whenever the bike is next in range, instead of us
-                    // hammering connectGatt() on a timer. A short delay avoids a
-                    // tight loop if the address is momentarily unusable.
+                    // Reconnect by actively SCANNING for the bike and connecting the
+                    // moment it advertises again. Field logs showed connectGatt(
+                    // autoConnect=true) silently never relinks on some phones, and a
+                    // blind direct connect to the address fails with status 255 while
+                    // the bike is off - even though classic/media BT reconnects fine.
+                    // Scanning is the reliable signal that the dash is actually back.
                     lifecycleScope.launch {
-                        delay(2000)
+                        delay(1500)
                         val addr = AppSettings(this@BccuConnectionService).bondedDeviceAddress
-                        if (addr != null && gatt == null) {
-                            AppLogger.log("BLE", "Requesting background reconnect to $addr")
-                            connect(addr, autoConnect = true)
-                        }
+                        if (addr != null && gatt == null) startBleScan(addr)
                     }
                 }
             } catch (e: Exception) {
@@ -400,6 +720,13 @@ class BccuConnectionService : LifecycleService() {
         override fun onMtuChanged(g: BluetoothGatt, mtu: Int, status: Int) {
             try {
                 AppLogger.log("BLE", "onMtuChanged mtu=$mtu status=$status")
+                if (g.getService(BccuProtocol.MAIN_SERVICE) == null) {
+                    // MTU event raced ahead of service discovery (seen on a reused
+                    // ACL, field log 19:17:15). onServicesDiscovered's requestMtu
+                    // lands us here again once the services actually exist.
+                    AppLogger.log("BLE", "MTU changed before services discovered - deferring CCCD setup")
+                    return
+                }
                 g.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
                 enableIndication(BccuProtocol.AUTH_REQUEST)
             } catch (e: Exception) {
@@ -557,7 +884,6 @@ class BccuConnectionService : LifecycleService() {
             tempIv = newIv
             tempSecret = newSecret
             writeCharacteristic(BccuProtocol.AUTH_REPLY, m2)
-            startHandshakeTimeout()
             return
         }
 
@@ -572,19 +898,19 @@ class BccuConnectionService : LifecycleService() {
 
         when {
             cmd == BccuProtocol.CMD_HELLO -> {
-                // Whether we reply cmd 0 or cmd 1 here is what makes the bike show (or
-                // skip) its physical "confirm new pairing" prompt - so this must be
-                // driven by persisted pairing history, not the in-memory session key
-                // pool (which is legitimately null at the start of every connection).
+                // Always echo HELLO back. Field logs proved this dash decides
+                // whether to show its "confirm pairing" prompt entirely from its
+                // own bond memory - not from which command we reply. Echoing
+                // HELLO is the ONLY reply it acts on: to a bonded dash it answers
+                // with GENERATE_KEYS in a few seconds and no prompt; to a genuinely
+                // new device it prompts and answers once the rider confirms (~30s).
+                // The old "known bike -> reply GENERATE_KEYS to skip the prompt"
+                // shortcut was silently ignored by the dash, stalling every single
+                // reconnect and (via the recovery) forcing a spurious re-pair.
                 val address = currentDeviceAddress
-                val pairedBefore = address != null && AppSettings(this@BccuConnectionService).hasPairedBefore(address)
-                if (pairedBefore) {
-                    AppLogger.log("Auth", "cmd=HELLO, known bike ($address) - requesting fresh key derivation (no prompt)")
-                    replyControl(BccuProtocol.CMD_GENERATE_KEYS)
-                } else {
-                    AppLogger.log("Auth", "cmd=HELLO, first time pairing ($address) - echoing back (bike will prompt on dash)")
-                    replyControl(BccuProtocol.CMD_HELLO)
-                }
+                val known = address != null && AppSettings(this@BccuConnectionService).hasPairedBefore(address)
+                AppLogger.log("Auth", "cmd=HELLO (${if (known) "known" else "new"} bike $address) - echoing HELLO; dash decides whether to prompt")
+                replyControl(BccuProtocol.CMD_HELLO)
             }
             cmd == BccuProtocol.CMD_GENERATE_KEYS -> {
                 AppLogger.log("Auth", "cmd=GENERATE_KEYS, deriving session keys")
@@ -606,6 +932,7 @@ class BccuConnectionService : LifecycleService() {
                     AppLogger.log("Auth", ">>> AUTHENTICATED <<< (key index $keyIndex)")
                     handshakeTimeoutJob?.cancel(); handshakeTimeoutJob = null
                     handshakeRecoveries = 0
+                    stopBleScan()
                     _connectionState.value = ConnectionState.AUTHENTICATED
                     currentDeviceAddress?.let {
                         val s = AppSettings(this@BccuConnectionService)
@@ -629,33 +956,48 @@ class BccuConnectionService : LifecycleService() {
     }
 
     /**
-     * Watchdog for a handshake that never completes. If we don't reach
-     * AUTHENTICATED within [HANDSHAKE_TIMEOUT_MS] and this bike is marked
-     * paired-before (so we replied GENERATE_KEYS), the dash has almost certainly
-     * lost its keys - forget the pairing and reconnect so the next handshake
-     * sends a fresh HELLO and the dash shows its "add device" prompt. Self-heals
-     * the "stuck at handshaking, can't even re-pair" case without a data wipe.
+     * Watchdog for a handshake that never completes, armed the moment the link
+     * comes up. The budget spans link-up -> AUTHENTICATED: a bonded dash gets
+     * there in ~3s, but right after ignition-on its pairing manager can lag its
+     * radio - it sends m1/HELLO then goes silent (or, on a reused ACL, never
+     * sends m1 at all) - and the only cure is a clean link drop + a genuinely
+     * fresh connection. Recovery goes through SCAN, never a direct connect: the
+     * dash only advertises once the old ACL is truly gone, so "found in scan"
+     * guarantees the next connection restarts auth with a fresh m1. (A direct
+     * connect 1.5s after close() was field-observed re-attaching to the
+     * still-live ACL in 78ms: no m1, no auth, dead until ignition-off.) There
+     * is no retry cap - each cycle is cheap and self-paced by the dash's own
+     * advertising, and capping it left a stalled dash permanently unrecovered.
+     * We deliberately do NOT clear the pairing: the dash owns the prompt
+     * decision from its own bond memory, so forgetting our flag only risks a
+     * needless "add device" prompt.
      */
     private fun startHandshakeTimeout() {
         handshakeTimeoutJob?.cancel()
         handshakeTimeoutJob = lifecycleScope.launch {
-            delay(HANDSHAKE_TIMEOUT_MS)
-            if (_connectionState.value == ConnectionState.AUTHENTICATED) return@launch
             val addr = currentDeviceAddress ?: return@launch
-            val settings = AppSettings(this@BccuConnectionService)
-            if (settings.hasPairedBefore(addr) && handshakeRecoveries < MAX_HANDSHAKE_RECOVERIES) {
-                handshakeRecoveries++
-                AppLogger.log("Auth", "Handshake stalled ${HANDSHAKE_TIMEOUT_MS}ms - dash lost its keys; forgetting pairing and reconnecting for a fresh HELLO (attempt $handshakeRecoveries)")
-                settings.clearPairedBefore(addr)
-                try { gatt?.disconnect(); gatt?.close() } catch (e: Exception) { /* ignore */ }
-                gatt = null
-                tempIv = null; tempSecret = null; sessionKeys = null; activeSessionKey = null
-                _connectionState.value = ConnectionState.DISCONNECTED
-                delay(1500)
-                connect(addr, autoConnect = false)
-            } else {
-                AppLogger.log("Auth", "Handshake stalled but no auto-recovery (paired=${settings.hasPairedBefore(addr)}, tries=$handshakeRecoveries)")
-            }
+            val known = AppSettings(this@BccuConnectionService).hasPairedBefore(addr)
+            val budget = if (known) HANDSHAKE_TIMEOUT_KNOWN_MS else HANDSHAKE_TIMEOUT_FIRST_PAIR_MS
+            delay(budget)
+            if (_connectionState.value == ConnectionState.AUTHENTICATED) return@launch
+            handshakeRecoveries++
+            // Back off instead of looping: one quickish retry, then long
+            // cooldowns. Rapid drop/reconnect cycles against a booting dash
+            // were suspected of re-triggering its "add device" prompt (R21
+            // field report) - giving it time to finish waking beats hammering.
+            val cooldown = if (handshakeRecoveries <= 1) RETRY_COOLDOWN_FIRST_MS else RETRY_COOLDOWN_LATER_MS
+            AppLogger.log("Auth", "Handshake didn't complete in ${budget}ms - dropping the link, retrying in ${cooldown / 1000}s (attempt $handshakeRecoveries; pairing kept)")
+            try { gatt?.disconnect(); gatt?.close() } catch (e: Exception) { /* ignore */ }
+            gatt = null
+            // Drop any op stranded in flight on the dead link - otherwise
+            // gattBusy stays true and every op on the next connection stalls
+            // behind it forever (the stale-GATT guard means the late
+            // DISCONNECTED callback no longer clears the queue for us).
+            clearGattQueue()
+            tempIv = null; tempSecret = null; sessionKeys = null; activeSessionKey = null
+            _connectionState.value = ConnectionState.DISCONNECTED
+            delay(cooldown)
+            if (gatt == null) startBleScan(addr)
         }
     }
 
@@ -676,30 +1018,110 @@ class BccuConnectionService : LifecycleService() {
             val isPressed = (mask shr button.bitIndex) and 1 == 1
             if (!wasPressed && isPressed) {
                 AppLogger.log("RCM", "Handlebar button event: ${button.name}")
-                _buttonEvents.tryEmit(button)
-                if (button == BccuProtocol.HandlebarButton.BACK && !AppForegroundState.isForeground) {
-                    // In gamepad mode, BACK must fall through to the foreground app
-                    // (the accessibility service turns it into a global Back), NOT
-                    // yank OpenDash to the front - otherwise you could never use
-                    // Back inside another app. Only relaunch when gamepad is off.
-                    if (AppSettings(this).gamepadEnabled &&
-                        com.opendash.app.controller.RemoteControlAccessibilityService.isRunning
-                    ) {
-                        AppLogger.log("RCM", "App backgrounded + gamepad on - leaving BACK to the foreground app")
-                    } else {
-                        // Relaunch directly from the service rather than relying on
-                        // MainActivity's own collector to notice this event - if the
-                        // Activity was destroyed while backgrounded, nothing would be
-                        // left to react to it and Back would silently do nothing.
-                        AppLogger.log("RCM", "App backgrounded, relaunching MainActivity")
-                        val intent = Intent(this, com.opendash.app.ui.MainActivity::class.java)
-                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
-                        startActivity(intent)
-                    }
-                }
+                onHandlebarButton(button)
             }
         }
         lastRcmMask = mask
+    }
+
+    /**
+     * Central routing for every handlebar press. Precedence:
+     * 1. If the mode-picker overlay is up, the buttons drive IT (Up/Down select,
+     *    Set confirm, Back close) and go nowhere else.
+     * 2. Triple-press Up (3 within [TRIPLE_UP_WINDOW_MS]) opens the mode picker.
+     * 3. Otherwise emit as normal - consumers (media/menu state machine, gamepad
+     *    accessibility service) act based on the chosen [AppSettings.remoteMode].
+     */
+    private fun onHandlebarButton(button: BccuProtocol.HandlebarButton) {
+        if (modeOverlay?.isShowing == true) {
+            mainHandler.post {
+                val ov = modeOverlay ?: return@post
+                when (button) {
+                    BccuProtocol.HandlebarButton.UP -> ov.moveSelection(-1)
+                    BccuProtocol.HandlebarButton.DOWN -> ov.moveSelection(+1)
+                    BccuProtocol.HandlebarButton.SET -> ov.confirm()
+                    BccuProtocol.HandlebarButton.BACK -> ov.hide()
+                }
+            }
+            return
+        }
+
+        if (button == BccuProtocol.HandlebarButton.UP) {
+            val now = System.currentTimeMillis()
+            upPressTimes.addLast(now)
+            while (upPressTimes.isNotEmpty() && now - upPressTimes.first() > TRIPLE_UP_WINDOW_MS) upPressTimes.removeFirst()
+            if (upPressTimes.size >= 3) {
+                upPressTimes.clear()
+                showModeOverlay()
+                return
+            }
+        } else {
+            upPressTimes.clear()
+        }
+
+        _buttonEvents.tryEmit(button)
+
+        if (button == BccuProtocol.HandlebarButton.BACK && !AppForegroundState.isForeground) {
+            // In gamepad mode, BACK falls through to the foreground app (the
+            // accessibility service makes it a global Back); otherwise bring
+            // Navigator Gen3 forward so Back opens its menu.
+            val gamepad = AppSettings(this).remoteMode == AppSettings.MODE_GAMEPAD &&
+                com.opendash.app.controller.RemoteControlAccessibilityService.isRunning
+            if (gamepad) {
+                AppLogger.log("RCM", "Gamepad mode - leaving BACK to the foreground app")
+            } else {
+                val intent = Intent(this, com.opendash.app.ui.MainActivity::class.java)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
+                startActivity(intent)
+            }
+        }
+    }
+
+    private fun showModeOverlay() {
+        mainHandler.post {
+            if (modeOverlay == null) modeOverlay = com.opendash.app.controller.RemoteModeOverlay(this) { mode ->
+                applyRemoteMode(mode)
+            }
+            val ov = modeOverlay ?: return@post
+            if (!ov.canShow()) {
+                AppLogger.log("RCM", "Mode overlay: no draw-over-apps permission - opening settings")
+                runCatching {
+                    startActivity(
+                        Intent(android.provider.Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                            android.net.Uri.parse("package:$packageName"))
+                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    )
+                }
+                return@post
+            }
+            AppLogger.log("RCM", "Opening handlebar mode overlay")
+            ov.show(AppSettings(this).remoteMode)
+        }
+    }
+
+    private fun applyRemoteMode(mode: String) {
+        val s = AppSettings(this)
+        s.remoteMode = mode
+        AppLogger.log("RCM", "Remote mode set to $mode")
+        when (mode) {
+            AppSettings.MODE_GAMEPAD -> {
+                s.gamepadEnabled = true
+                if (!com.opendash.app.controller.RemoteControlAccessibilityService.isRunning) {
+                    runCatching {
+                        startActivity(Intent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS)
+                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                    }
+                }
+            }
+            AppSettings.MODE_DASH -> {
+                s.gamepadEnabled = false
+                runCatching {
+                    startActivity(Intent(this, com.opendash.app.ui.MainActivity::class.java)
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT))
+                }
+            }
+            else -> s.gamepadEnabled = false // MEDIA
+        }
     }
 
     private fun replyControl(command: Int) {
@@ -719,7 +1141,7 @@ class BccuConnectionService : LifecycleService() {
         }
         AppLogger.log("Dash", "Sending TURN_ICON = ${icon.name}")
         val payload = BccuProtocol.buildTurnIconPayload(icon, visibility)
-        writeCharacteristic(BccuProtocol.TURN_ICON, BccuCrypto.encryptData(payload, key, iv))
+        writeCharacteristic(BccuProtocol.TURN_ICON, BccuCrypto.encryptData(payload, key, iv), coalesce = true)
     }
 
     /**
@@ -741,6 +1163,7 @@ class BccuConnectionService : LifecycleService() {
         clearJob?.cancel()
         marqueeJob?.cancel()
         lastNotificationIcon = icon
+        bannerOwnedByMessage = true
 
         val marquee = AppSettings(this).marqueeEnabled && text.length > NOTIFICATION_BANNER_CHARS
         if (marquee) {
@@ -778,11 +1201,38 @@ class BccuConnectionService : LifecycleService() {
         clearNotificationDisplay()
     }
 
+    // True while a mirrored message (not a status readout) is on the banner.
+    // The overspeed readout must never steal the banner mid-message: without
+    // this, speed refreshes every second cancelled the message marquee and the
+    // two texts ping-ponged unreadably (R19 review finding).
+    @Volatile private var bannerOwnedByMessage = false
+
+    /**
+     * Live overspeed readout for the bottom banner. Lower priority than
+     * messages: skipped while a message is still displaying; auto-clears a few
+     * seconds after the last update (i.e. once the rider slows back down).
+     */
+    fun sendSpeedBanner(text: String) {
+        if (activeSessionKey == null || tempIv == null) return
+        if (bannerOwnedByMessage && (marqueeJob?.isActive == true || clearJob?.isActive == true)) {
+            return // a message is on the banner - let it finish its scroll/clear
+        }
+        bannerOwnedByMessage = false
+        marqueeJob?.cancel()
+        clearJob?.cancel()
+        lastNotificationIcon = BccuProtocol.NotificationIcon.NOTIFICATION_WAYPOINT
+        writeNotificationFrame(text, BccuProtocol.NotificationIcon.NOTIFICATION_WAYPOINT, BccuProtocol.Visibility.FULL)
+        clearJob = lifecycleScope.launch {
+            delay(NOTIFICATION_CLEAR_DELAY_MS)
+            clearNotificationDisplay()
+        }
+    }
+
     private fun writeNotificationFrame(text: String, icon: BccuProtocol.NotificationIcon, visibility: BccuProtocol.Visibility) {
         val key = activeSessionKey ?: return
         val iv = tempIv ?: return
         val payload = BccuProtocol.buildNotificationPayload(icon, text, visibility)
-        writeCharacteristic(BccuProtocol.NOTIFICATION, BccuCrypto.encryptData(payload, key, iv))
+        writeCharacteristic(BccuProtocol.NOTIFICATION, BccuCrypto.encryptData(payload, key, iv), coalesce = true)
     }
 
     /**
@@ -794,11 +1244,12 @@ class BccuConnectionService : LifecycleService() {
      * stuck on screen. Text is blanked too for good measure.
      */
     private fun clearNotificationDisplay() {
+        bannerOwnedByMessage = false
         val key = activeSessionKey ?: return
         val iv = tempIv ?: return
         AppLogger.log("Dash", "Clearing NOTIFICATION display (visibility OFF, icon=${lastNotificationIcon.name})")
         val payload = BccuProtocol.buildNotificationPayload(lastNotificationIcon, "", BccuProtocol.Visibility.OFF)
-        writeCharacteristic(BccuProtocol.NOTIFICATION, BccuCrypto.encryptData(payload, key, iv))
+        writeCharacteristic(BccuProtocol.NOTIFICATION, BccuCrypto.encryptData(payload, key, iv), coalesce = true)
     }
 
     /**
@@ -817,11 +1268,11 @@ class BccuConnectionService : LifecycleService() {
         AppLogger.log("Dash", "Sending connect greeting: \"$text\"")
         val full = BccuProtocol.Visibility.FULL
         writeCharacteristic(BccuProtocol.TURN_ICON,
-            BccuCrypto.encryptData(BccuProtocol.buildTurnIconPayload(BccuProtocol.TurnIcon.START, full), key, iv))
+            BccuCrypto.encryptData(BccuProtocol.buildTurnIconPayload(BccuProtocol.TurnIcon.START, full), key, iv), coalesce = true)
         writeCharacteristic(BccuProtocol.TURN_ROAD,
-            BccuCrypto.encryptData(BccuProtocol.buildTurnRoadPayload(text, full), key, iv))
+            BccuCrypto.encryptData(BccuProtocol.buildTurnRoadPayload(text, full), key, iv), coalesce = true)
         writeCharacteristic(BccuProtocol.TURN_DISTANCE,
-            BccuCrypto.encryptData(BccuProtocol.buildTurnDistancePayload("", BccuProtocol.Visibility.OFF), key, iv))
+            BccuCrypto.encryptData(BccuProtocol.buildTurnDistancePayload("", BccuProtocol.Visibility.OFF), key, iv), coalesce = true)
         // Reuse the guidance-clear job: a real guidance update cancels it, so the
         // greeting is replaced seamlessly the moment navigation starts.
         guidanceClearJob?.cancel()
@@ -863,22 +1314,22 @@ class BccuConnectionService : LifecycleService() {
         if (distanceText != null) {
             AppLogger.log("Dash", "Sending TURN_DISTANCE = \"$distanceText\"")
             val payload = BccuProtocol.buildTurnDistancePayload(distanceText)
-            writeCharacteristic(BccuProtocol.TURN_DISTANCE, BccuCrypto.encryptData(payload, key, iv))
+            writeCharacteristic(BccuProtocol.TURN_DISTANCE, BccuCrypto.encryptData(payload, key, iv), coalesce = true)
         }
         if (roadText != null) {
             AppLogger.log("Dash", "Sending TURN_ROAD = \"$roadText\"")
             val payload = BccuProtocol.buildTurnRoadPayload(roadText)
-            writeCharacteristic(BccuProtocol.TURN_ROAD, BccuCrypto.encryptData(payload, key, iv))
+            writeCharacteristic(BccuProtocol.TURN_ROAD, BccuCrypto.encryptData(payload, key, iv), coalesce = true)
         }
         if (etaText != null) {
             AppLogger.log("Dash", "Sending ETA = \"$etaText\"")
             val payload = BccuProtocol.buildEtaPayload(etaText)
-            writeCharacteristic(BccuProtocol.ETA, BccuCrypto.encryptData(payload, key, iv))
+            writeCharacteristic(BccuProtocol.ETA, BccuCrypto.encryptData(payload, key, iv), coalesce = true)
         }
         if (remainingDistanceText != null) {
             AppLogger.log("Dash", "Sending REMAINING_DISTANCE = \"$remainingDistanceText\"")
             val payload = BccuProtocol.buildRemainingDistancePayload(remainingDistanceText)
-            writeCharacteristic(BccuProtocol.REMAINING_DISTANCE, BccuCrypto.encryptData(payload, key, iv))
+            writeCharacteristic(BccuProtocol.REMAINING_DISTANCE, BccuCrypto.encryptData(payload, key, iv), coalesce = true)
         }
     }
 
@@ -904,22 +1355,25 @@ class BccuConnectionService : LifecycleService() {
      * forever after the rider exited Maps.
      */
     private fun clearGuidance() {
+        // Navigation genuinely ended (this call is debounced past Maps' routine
+        // remove+repost) - let the next route's first approach beep fire again.
+        com.opendash.app.audio.TurnBeeper.reset()
         val key = activeSessionKey ?: return
         val iv = tempIv ?: return
         AppLogger.log("Dash", "Clearing center guidance (navigation ended)")
         val off = BccuProtocol.Visibility.OFF
         writeCharacteristic(BccuProtocol.TURN_ICON,
-            BccuCrypto.encryptData(BccuProtocol.buildTurnIconPayload(BccuProtocol.TurnIcon.UNDEFINED, off), key, iv))
+            BccuCrypto.encryptData(BccuProtocol.buildTurnIconPayload(BccuProtocol.TurnIcon.UNDEFINED, off), key, iv), coalesce = true)
         writeCharacteristic(BccuProtocol.TURN_DISTANCE,
-            BccuCrypto.encryptData(BccuProtocol.buildTurnDistancePayload("", off), key, iv))
+            BccuCrypto.encryptData(BccuProtocol.buildTurnDistancePayload("", off), key, iv), coalesce = true)
         writeCharacteristic(BccuProtocol.TURN_INFO,
-            BccuCrypto.encryptData(BccuProtocol.buildTurnInfoPayload("", off), key, iv))
+            BccuCrypto.encryptData(BccuProtocol.buildTurnInfoPayload("", off), key, iv), coalesce = true)
         writeCharacteristic(BccuProtocol.TURN_ROAD,
-            BccuCrypto.encryptData(BccuProtocol.buildTurnRoadPayload("", off), key, iv))
+            BccuCrypto.encryptData(BccuProtocol.buildTurnRoadPayload("", off), key, iv), coalesce = true)
         writeCharacteristic(BccuProtocol.ETA,
-            BccuCrypto.encryptData(BccuProtocol.buildEtaPayload("", off), key, iv))
+            BccuCrypto.encryptData(BccuProtocol.buildEtaPayload("", off), key, iv), coalesce = true)
         writeCharacteristic(BccuProtocol.REMAINING_DISTANCE,
-            BccuCrypto.encryptData(BccuProtocol.buildRemainingDistancePayload("", off), key, iv))
+            BccuCrypto.encryptData(BccuProtocol.buildRemainingDistancePayload("", off), key, iv), coalesce = true)
     }
 
     // --- Telemetry (PRPC) ---
@@ -1126,9 +1580,16 @@ class BccuConnectionService : LifecycleService() {
         AppLogger.log("Probe", "=== probeVehicleInfo: requests queued ===")
     }
 
+    /**
+     * @param coalesce true for "latest value wins" display writes (guidance
+     * labels, marquee frames, banner): a still-queued older write to the same
+     * characteristic is dropped, keeping the queue bounded and frames fresh on
+     * a slow link. Never set for control-plane writes (auth replies, PRPC
+     * requests) where every message matters.
+     */
     @Suppress("DEPRECATION")
-    private fun writeCharacteristic(uuid: java.util.UUID, data: ByteArray) {
-        enqueueGattOp {
+    private fun writeCharacteristic(uuid: java.util.UUID, data: ByteArray, coalesce: Boolean = false) {
+        enqueueGattOp(if (coalesce) uuid else null) {
             val g = gatt
             val characteristic = g?.let { findCharacteristic(it, uuid) }
             if (g == null || characteristic == null) {

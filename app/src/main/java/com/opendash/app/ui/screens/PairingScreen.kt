@@ -125,6 +125,18 @@ fun PairingScreen(settings: AppSettings, onPaired: () -> Unit, onOpenLogs: () ->
         }
         val scanner = adapter?.takeIf { it.isEnabled }?.bluetoothLeScanner ?: return
         foundDevices.clear()
+        // Seed the list with devices already bonded to this phone (e.g. the bike
+        // paired for media/calls). A bonded dash may not actively advertise BLE
+        // when it's connected via classic Bluetooth, so a scan alone can miss it —
+        // listing bonds lets the rider pick their bike directly ("use my saved
+        // bike"). KTM-named ones sort to the top in the UI.
+        try {
+            adapter?.bondedDevices?.forEach { dev ->
+                if (foundDevices.none { it.device.address == dev.address }) {
+                    foundDevices.add(FoundDevice(dev, 0))
+                }
+            }
+        } catch (e: SecurityException) { /* ignore */ }
         scanning = true
         try {
             scanner.startScan(scanCallback)
@@ -189,7 +201,7 @@ fun PairingScreen(settings: AppSettings, onPaired: () -> Unit, onOpenLogs: () ->
         )
         Text(
             if (!btGranted)
-                "OpenDash needs the Nearby devices\npermission to find your bike's dash."
+                "Navigator Gen3 needs the Nearby devices\npermission to find your bike's dash."
             else
                 "Turn the ignition on and keep\nyour phone near the dash.",
             color = Ktm.Muted2,

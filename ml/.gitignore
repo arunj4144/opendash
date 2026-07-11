@@ -1,0 +1,5 @@
+.venv/
+_saved_model/
+*.log
+train*.log
+aug_debug.png

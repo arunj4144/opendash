@@ -72,7 +72,7 @@ fun KtmToggle(
                 .align(Alignment.CenterStart)
                 .size(18.dp)
                 .clip(CircleShape)
-                .background(if (checked) Ktm.Screen else Ktm.Muted),
+                .background(if (checked) Ktm.OnAccent else Ktm.Muted),
         )
     }
 }
@@ -153,7 +153,7 @@ fun KtmPrimaryButton(
         contentAlignment = Alignment.Center,
     ) {
         Text(
-            text.uppercase(), color = if (enabled) Ktm.Screen else Ktm.Dim,
+            text.uppercase(), color = if (enabled) Ktm.OnAccent else Ktm.Dim,
             fontFamily = BarlowCondensed, fontWeight = FontWeight.Bold, fontSize = 16.sp, letterSpacing = 1.5.sp,
         )
     }

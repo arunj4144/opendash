@@ -68,7 +68,12 @@ private data class Tile(
  * obvious; tiles are also tappable and feed the same pipeline.
  */
 @Composable
-fun GridMenuScreen(gridSelection: Int, onSelectGrid: (Int) -> Unit, onOpenSettings: () -> Unit) {
+fun GridMenuScreen(
+    gridSelection: Int,
+    onSelectGrid: (Int) -> Unit,
+    onOpenSettings: () -> Unit,
+    onOpenRides: () -> Unit = {},
+) {
     val context = LocalContext.current
     var notificationAccessGranted by remember {
         mutableStateOf(NotificationManagerCompat.getEnabledListenerPackages(context).contains(context.packageName))
@@ -111,23 +116,51 @@ fun GridMenuScreen(gridSelection: Int, onSelectGrid: (Int) -> Unit, onOpenSettin
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween,
         ) {
-            Row {
-                Text("OPEN", color = Ktm.White, fontFamily = BarlowCondensed,
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("NAVIGATOR", color = Ktm.White, fontFamily = BarlowCondensed,
                     fontWeight = FontWeight.Bold, fontStyle = FontStyle.Italic, fontSize = 20.sp)
-                Text("DASH", color = Ktm.Orange, fontFamily = BarlowCondensed,
-                    fontWeight = FontWeight.Bold, fontStyle = FontStyle.Italic, fontSize = 20.sp)
+                Spacer(Modifier.size(8.dp))
+                // Brand pill — shows which bike skin is active (KTM / Husqvarna).
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(6.dp))
+                        .background(Ktm.Orange)
+                        .padding(horizontal = 9.dp, vertical = 3.dp),
+                ) {
+                    Text(
+                        com.opendash.app.ui.theme.themeFor(
+                            com.opendash.app.settings.AppSettings(context).brand
+                        ).displayName.uppercase(),
+                        color = Ktm.OnAccent, fontFamily = BarlowCondensed, fontWeight = FontWeight.Bold,
+                        fontSize = 12.sp, letterSpacing = 0.8.sp,
+                    )
+                }
             }
-            Icon(
-                OpenDashIcons.Settings, contentDescription = "Settings", tint = Ktm.Muted,
-                modifier = Modifier
-                    .clip(CircleShape)
-                    .clickable(onClick = onOpenSettings)
-                    .padding(6.dp)
-                    .size(22.dp),
-            )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                // Rides (GPX viewer) - touch-only, like the settings gear.
+                Icon(
+                    OpenDashIcons.Navigation, contentDescription = "Rides", tint = Ktm.Muted,
+                    modifier = Modifier
+                        .clip(CircleShape)
+                        .clickable(onClick = onOpenRides)
+                        .padding(6.dp)
+                        .size(22.dp),
+                )
+                Spacer(Modifier.size(2.dp))
+                Icon(
+                    OpenDashIcons.Settings, contentDescription = "Settings", tint = Ktm.Muted,
+                    modifier = Modifier
+                        .clip(CircleShape)
+                        .clickable(onClick = onOpenSettings)
+                        .padding(6.dp)
+                        .size(22.dp),
+                )
+            }
         }
 
         ConnectionBanner()
+
+        QuickToggles()
 
         Text(
             buildReadyHeadline(),
@@ -173,6 +206,68 @@ private inline fun androidx.compose.ui.text.AnnotatedString.Builder.withStyleCol
     pushStyle(androidx.compose.ui.text.SpanStyle(color = color))
     block()
     pop()
+}
+
+/**
+ * One-tap ride tools right on the home screen (R20 field request): the
+ * settings that get flipped at the kerb - approach beeps, overspeed alert,
+ * power saver - without digging into Settings. Touch-only, deliberately not on
+ * the handlebar-remote path (the 2x2 grid below owns that).
+ */
+@Composable
+private fun QuickToggles() {
+    val context = LocalContext.current
+    val settings = remember { com.opendash.app.settings.AppSettings(context) }
+    var beeps by remember { mutableStateOf(settings.turnBeepEnabled) }
+    var overspeed by remember { mutableStateOf(settings.overspeedEnabled) }
+    var powerSave by remember { mutableStateOf(settings.powerSaveEnabled) }
+
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(top = 10.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        QuickChip("BEEPS", beeps, Modifier.weight(1f)) {
+            beeps = !beeps; settings.turnBeepEnabled = beeps
+            if (!beeps) com.opendash.app.audio.TurnBeeper.reset()
+        }
+        QuickChip("SPEED", overspeed, Modifier.weight(1f)) {
+            overspeed = !overspeed; settings.overspeedEnabled = overspeed
+        }
+        QuickChip("PWR SAVE", powerSave, Modifier.weight(1f)) {
+            powerSave = !powerSave; settings.powerSaveEnabled = powerSave
+            BccuConnectionService.reevaluateRouteRecordingIfRunning()
+            BccuConnectionService.reevaluateEngineDetectIfRunning()
+        }
+    }
+}
+
+@Composable
+private fun QuickChip(label: String, on: Boolean, modifier: Modifier = Modifier, onToggle: () -> Unit) {
+    Column(
+        modifier = modifier
+            .clip(RoundedCornerShape(9.dp))
+            .background(if (on) Ktm.SurfaceAlt else Ktm.Surface)
+            .border(1.dp, if (on) Ktm.Orange else Ktm.Border, RoundedCornerShape(9.dp))
+            .clickable(onClick = onToggle)
+            .padding(vertical = 8.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Box(
+            modifier = Modifier
+                .size(7.dp)
+                .clip(CircleShape)
+                .background(if (on) Ktm.Green else Ktm.Dim),
+        )
+        Text(
+            label,
+            color = if (on) Ktm.White else Ktm.Dim,
+            fontFamily = BarlowCondensed,
+            fontWeight = FontWeight.Bold,
+            fontSize = 11.sp,
+            letterSpacing = 0.8.sp,
+            modifier = Modifier.padding(top = 4.dp),
+        )
+    }
 }
 
 @Composable

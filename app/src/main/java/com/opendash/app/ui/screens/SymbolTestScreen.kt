@@ -129,7 +129,7 @@ private fun IconTestRow(
     ) {
         if (leading != null) leading()
         Text(label, color = Ktm.TextPrimary, fontFamily = JetBrainsMono, fontSize = 12.sp, modifier = Modifier.weight(1f))
-        PillButton("SEND", Ktm.Orange, Ktm.Screen) {
+        PillButton("SEND", Ktm.Orange, Ktm.OnAccent) {
             AppLogger.log("SymbolTest", "Sending $key")
             onSend()
         }

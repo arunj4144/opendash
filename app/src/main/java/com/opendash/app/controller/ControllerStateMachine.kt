@@ -44,6 +44,8 @@ class ControllerStateMachine(private val actions: Actions) {
         fun openMaps()
         fun bringAppToForeground()
         fun showWatchdogWarning()
+        /** Fully quit: stop the connection service (removes its notification) and kill the app task. */
+        fun exitApp()
     }
 
     /** Immutable snapshot of everything the UI renders from. */
@@ -161,7 +163,10 @@ class ControllerStateMachine(private val actions: Actions) {
                 actions.minimizeToHome()
                 update { it.copy(screen = ControllerScreen.IDLE) }
             }
-            "Exit" -> update { it.copy(screen = ControllerScreen.IDLE) }
+            "Exit" -> {
+                update { it.copy(screen = ControllerScreen.IDLE) }
+                actions.exitApp()
+            }
         }
     }
 

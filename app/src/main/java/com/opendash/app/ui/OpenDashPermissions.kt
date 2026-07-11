@@ -21,10 +21,13 @@ object OpenDashPermissions {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             perms += Manifest.permission.BLUETOOTH_CONNECT
             perms += Manifest.permission.BLUETOOTH_SCAN
-        } else {
-            // Pre-Android 12, a BLE scan requires location permission instead.
-            perms += Manifest.permission.ACCESS_FINE_LOCATION
         }
+        // GPS features (overspeed, waypoint, route recording) on every SDK; on
+        // pre-Android-12 this also covers the BLE scan requirement. FINE must be
+        // requested TOGETHER WITH COARSE: on Android 12+ a request containing
+        // FINE alone is silently ignored (no dialog, nothing granted).
+        perms += Manifest.permission.ACCESS_FINE_LOCATION
+        perms += Manifest.permission.ACCESS_COARSE_LOCATION
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             perms += Manifest.permission.POST_NOTIFICATIONS
         }

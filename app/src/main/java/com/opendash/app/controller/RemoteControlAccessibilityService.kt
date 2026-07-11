@@ -87,12 +87,17 @@ class RemoteControlAccessibilityService : AccessibilityService() {
     // would make focus never advance). Reset whenever the window changes.
     private var selectionIndex = -1
     private var lastWindowId = -1
+    private var lastPressAtMs = 0L
 
     private fun handleButton(button: BccuProtocol.HandlebarButton) {
-        // Only act as a system gamepad when enabled AND OpenDash isn't the app in
-        // front (OpenDash drives its own UI itself). This is the clean hand-off.
-        if (!AppSettings(this).gamepadEnabled) return
-        if (AppForegroundState.isForeground) return
+        lastPressAtMs = System.currentTimeMillis()
+        // Only act as a system gamepad when the remote is in GAMEPAD mode AND
+        // Navigator Gen3 isn't the foreground app (it drives its own UI itself).
+        // Leaving gamepad mode must also clear any lingering selection box.
+        if (AppSettings(this).remoteMode != AppSettings.MODE_GAMEPAD || AppForegroundState.isForeground) {
+            hideHighlight()
+            return
+        }
 
         when (button) {
             BccuProtocol.HandlebarButton.UP -> moveSelection(-1)
@@ -119,7 +124,12 @@ class RemoteControlAccessibilityService : AccessibilityService() {
             AppLogger.log("Gamepad", "move: no actionable nodes")
             return
         }
-        val target = selectionIndex + delta
+        // First press after a window change: seed the selection at the nearest
+        // end so something visibly highlights immediately (UP used to compute
+        // -2 and appear completely dead until a DOWN was pressed first).
+        val target = if (selectionIndex == -1) {
+            if (delta > 0) 0 else nodes.size - 1
+        } else selectionIndex + delta
         if (target < 0 || target >= nodes.size) {
             // Past an end: scroll to reveal more, keep the selection pinned to the edge.
             val scrollable = firstScrollable(root)
@@ -135,7 +145,62 @@ class RemoteControlAccessibilityService : AccessibilityService() {
         selectionIndex = target
         val node = nodes[selectionIndex]
         node.performAction(AccessibilityNodeInfo.ACTION_ACCESSIBILITY_FOCUS)
+        // ACTION_ACCESSIBILITY_FOCUS moves the logical focus but draws NOTHING
+        // visible unless TalkBack-style services are on - which is exactly the
+        // "gamepad doesn't move anything on the screen" report. Scroll the node
+        // into view and draw our own highlight box over it.
+        node.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_SHOW_ON_SCREEN.id)
+        showHighlight(node)
         AppLogger.log("Gamepad", "select ${selectionIndex + 1}/${nodes.size} ${describe(node)}")
+    }
+
+    // --- Visible selection highlight (accessibility overlay) ---
+
+    private var highlightView: android.view.View? = null
+
+    /** Draw (or move) an orange rounded-rect outline over [node]'s screen bounds. */
+    private fun showHighlight(node: AccessibilityNodeInfo) {
+        try {
+            val bounds = android.graphics.Rect()
+            node.getBoundsInScreen(bounds)
+            if (bounds.isEmpty) return
+            val wm = getSystemService(WINDOW_SERVICE) as android.view.WindowManager
+            val view = highlightView ?: android.view.View(this).apply {
+                background = android.graphics.drawable.GradientDrawable().apply {
+                    setStroke((4 * resources.displayMetrics.density).toInt(), 0xFFFF6600.toInt())
+                    cornerRadius = 12 * resources.displayMetrics.density
+                    setColor(0x22FF6600)
+                }
+            }.also { highlightView = it }
+            val lp = android.view.WindowManager.LayoutParams(
+                bounds.width(), bounds.height(),
+                android.view.WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    android.view.WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                    // getBoundsInScreen() is in absolute screen coordinates; without
+                    // this the window is positioned relative to the area below the
+                    // status bar, drawing the box ~a status-bar too low everywhere.
+                    android.view.WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                    android.view.WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                android.graphics.PixelFormat.TRANSLUCENT,
+            ).apply {
+                gravity = android.view.Gravity.TOP or android.view.Gravity.START
+                x = bounds.left
+                y = bounds.top
+                if (android.os.Build.VERSION.SDK_INT >= 30) fitInsetsTypes = 0
+            }
+            if (view.parent == null) wm.addView(view, lp) else wm.updateViewLayout(view, lp)
+        } catch (e: Exception) {
+            AppLogger.log("Gamepad", "!! highlight failed: $e")
+        }
+    }
+
+    private fun hideHighlight() {
+        val view = highlightView ?: return
+        highlightView = null
+        runCatching {
+            if (view.parent != null) (getSystemService(WINDOW_SERVICE) as android.view.WindowManager).removeView(view)
+        }
     }
 
     /** Click the currently-selected node (walking up to a clickable ancestor). */
@@ -157,29 +222,44 @@ class RemoteControlAccessibilityService : AccessibilityService() {
         if (wid != lastWindowId) {
             lastWindowId = wid
             selectionIndex = -1
+            hideHighlight()
         }
     }
 
     /**
      * Flatten the node tree to a reading-ordered list of things worth selecting:
      * on-screen, enabled, and either clickable/checkable or a focusable node that
-     * carries a label. De-duplicates nested clickables (keeps the outermost).
+     * carries a label. Nested actionables keep the INNERMOST nodes: selecting the
+     * actual small buttons, not the whole-screen container around them (the R20
+     * field test hit full-page "Home screen 1"-sized selections that made SET
+     * unpredictable). A container with no actionable descendants is itself the
+     * leaf, so plain list rows still select as a row.
      */
     private fun collectActionable(root: AccessibilityNodeInfo): List<AccessibilityNodeInfo> {
         val out = ArrayList<AccessibilityNodeInfo>()
-        fun visit(node: AccessibilityNodeInfo?, clickableAncestor: Boolean) {
-            if (node == null) return
+        val minSidePx = (12 * resources.displayMetrics.density).toInt()
+        val bounds = android.graphics.Rect()
+        // Returns true when this subtree contributed at least one selectable.
+        fun visit(node: AccessibilityNodeInfo?): Boolean {
+            if (node == null) return false
+            var childTook = false
+            for (i in 0 until node.childCount) {
+                if (visit(node.getChild(i))) childTook = true
+            }
+            if (childTook) return true // descendants are the finer-grained targets
             val onScreen = node.isVisibleToUser && node.isEnabled
+            if (!onScreen) return false
             val labelled = !node.text.isNullOrBlank() || !node.contentDescription.isNullOrBlank()
             val actionable = node.isClickable || node.isCheckable || (node.isFocusable && labelled)
-            // Keep the outermost actionable container; don't also add its inner
-            // clickable children (avoids selecting the same row twice).
-            val take = actionable && !clickableAncestor && onScreen
-            if (take) out.add(node)
-            val childAncestor = clickableAncestor || node.isClickable
-            for (i in 0 until node.childCount) visit(node.getChild(i), childAncestor)
+            if (!actionable) return false
+            // Skip sub-finger-size targets (decorative 1px views showed up as
+            // unlabelled [View] selections that appeared to do nothing).
+            node.getBoundsInScreen(bounds)
+            if (bounds.width() < minSidePx || bounds.height() < minSidePx) return false
+            out.add(node)
+            return true
         }
-        visit(root, false)
+        visit(root)
         return out
     }
 
@@ -199,12 +279,27 @@ class RemoteControlAccessibilityService : AccessibilityService() {
         return "[$cls${if (!text.isNullOrBlank()) " '$text'" else if (!desc.isNullOrBlank()) " '$desc'" else ""}]"
     }
 
-    override fun onAccessibilityEvent(event: AccessibilityEvent?) { /* navigation is button-driven, nothing to do here */ }
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        // Remove the selection box only when the screen GENUINELY changed
+        // underneath it (another app came up, SET opened a new screen). The
+        // R20 field test showed it vanishing instantly after every press:
+        // WINDOW_STATE_CHANGED also fires for our own overlay being added and
+        // for cosmetic same-window events (Maps re-posts constantly), and the
+        // old unconditional hide + index reset made the selector unusable.
+        if (event?.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED || highlightView == null) return
+        if (event.packageName == packageName) return // our own highlight/mode-picker windows
+        if (System.currentTimeMillis() - lastPressAtMs < 1200) return // change WE caused (click/scroll)
+        val activeWid = rootInActiveWindow?.windowId ?: return
+        if (activeWid == lastWindowId) return // same window, just state noise
+        hideHighlight()
+        selectionIndex = -1
+    }
 
     override fun onInterrupt() { /* no-op */ }
 
     override fun onDestroy() {
         isRunning = false
+        hideHighlight()
         collectJob?.cancel()
         scope?.cancel()
         scope = null

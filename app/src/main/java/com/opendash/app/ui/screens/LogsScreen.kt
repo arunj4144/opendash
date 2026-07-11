@@ -70,7 +70,7 @@ fun LogsScreen(onBack: () -> Unit) {
                             putExtra(Intent.EXTRA_STREAM, uri)
                             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                         }
-                        context.startActivity(Intent.createChooser(intent, "Share OpenDash log"))
+                        context.startActivity(Intent.createChooser(intent, "Share Navigator Gen3 log"))
                     }
                     .padding(horizontal = 10.dp, vertical = 5.dp),
             )

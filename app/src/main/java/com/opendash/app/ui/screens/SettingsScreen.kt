@@ -67,7 +67,7 @@ import com.opendash.app.ui.theme.BarlowCondensed
 import com.opendash.app.ui.theme.Ktm
 import com.opendash.app.ui.theme.OpenDashIcons
 
-private enum class SettingsDialog { NONE, NAME, GEMINI, NAV_APP, MIRROR_APPS, CALL_AUDIO }
+private enum class SettingsDialog { NONE, NAME, GEMINI, GEMINI_MODEL, NAV_APP, MIRROR_APPS, CALL_AUDIO, OVERSPEED_LIMIT }
 
 /**
  * Settings (screen 05) — the §5 restructure into four labelled groups
@@ -85,6 +85,9 @@ fun SettingsScreen(
     onOpenLogs: () -> Unit,
     onOpenSymbolTest: () -> Unit,
     onOpenTurnCalibration: () -> Unit,
+    onOpenVibrationCalibration: () -> Unit = {},
+    onOpenRides: () -> Unit = {},
+    onChangeBrand: () -> Unit = {},
     onRepair: () -> Unit,
 ) {
     val context = LocalContext.current
@@ -99,6 +102,16 @@ fun SettingsScreen(
     var mirrorEnabled by remember { mutableStateOf(settings.mirrorEnabled) }
     var marqueeEnabled by remember { mutableStateOf(settings.marqueeEnabled) }
     var gamepadEnabled by remember { mutableStateOf(settings.gamepadEnabled) }
+    var geminiModel by remember { mutableStateOf(settings.geminiModel) }
+    var turnBeepEnabled by remember { mutableStateOf(settings.turnBeepEnabled) }
+    var beepVolume by remember { mutableStateOf(settings.beepVolumePercent) }
+    var powerSave by remember { mutableStateOf(settings.powerSaveEnabled) }
+    var engineDetect by remember { mutableStateOf(settings.engineDetectEnabled) }
+    var vibSensitivity by remember { mutableStateOf(settings.vibrationSensitivity) }
+    var overspeedEnabled by remember { mutableStateOf(settings.overspeedEnabled) }
+    var overspeedLimit by remember { mutableStateOf(settings.overspeedLimitKmh) }
+    var routeRecordEnabled by remember { mutableStateOf(settings.routeAutoRecordEnabled) }
+    var waypoint by remember { mutableStateOf(settings.waypoint) }
     var accessibilityGranted by remember {
         mutableStateOf(com.opendash.app.controller.RemoteControlAccessibilityService.isRunning)
     }
@@ -182,11 +195,17 @@ fun SettingsScreen(
                     SettingsRow("Re-pair vehicle", showDivider = true, onClick = onRepair) {
                         OutlinedPill("RE-PAIR")
                     }
+                    SettingsRow("Change bike / brand", showDivider = true, onClick = onChangeBrand) {
+                        MonoValue("${com.opendash.app.ui.theme.themeFor(settings.brand).displayName} ›")
+                    }
                     SettingsRow("Your name", showDivider = true, onClick = { dialog = SettingsDialog.NAME }) {
                         MonoValue(userName.ifBlank { "Set ›" })
                     }
-                    SettingsRow("Gemini API key", showDivider = false, onClick = { dialog = SettingsDialog.GEMINI }) {
+                    SettingsRow("Gemini API key", showDivider = true, onClick = { dialog = SettingsDialog.GEMINI }) {
                         MonoValue(maskKey(geminiKey))
+                    }
+                    SettingsRow("Gemini model", showDivider = false, onClick = { dialog = SettingsDialog.GEMINI_MODEL }) {
+                        MonoValue("$geminiModel ›")
                     }
                 }
             }
@@ -240,6 +259,232 @@ fun SettingsScreen(
                 }
             }
 
+            // ===== Riding =====
+            item {
+                GroupCard("Riding") {
+                    SettingsRow("Turn approach beeps (stereo)", showDivider = true) {
+                        KtmToggle(turnBeepEnabled, { turnBeepEnabled = it; settings.turnBeepEnabled = it })
+                    }
+                    // Tap to cycle presets - a slider is fiddly with gloves on.
+                    SettingsRow(
+                        "Beep volume", showDivider = true,
+                        onClick = {
+                            beepVolume = when {
+                                beepVolume < 35 -> 35
+                                beepVolume < 60 -> 60
+                                beepVolume < 100 -> 100
+                                else -> 20
+                            }
+                            settings.beepVolumePercent = beepVolume
+                        },
+                    ) {
+                        MonoValue("$beepVolume% ›")
+                    }
+                    SettingsRow("Swap beep left/right", showDivider = true) {
+                        var swapBeep by remember { mutableStateOf(settings.swapBeepChannels) }
+                        KtmToggle(swapBeep, { swapBeep = it; settings.swapBeepChannels = it })
+                    }
+                    // Hear-it-before-you-ride previews: the real beep at the
+                    // configured volume/side order, the real voice prompt, and
+                    // the overspeed tone (R21 field request).
+                    SettingsRow(
+                        "Hear turn beeps (L-R-L)", showDivider = true,
+                        onClick = {
+                            com.opendash.app.audio.TurnBeeper.volumePercent = settings.beepVolumePercent
+                            com.opendash.app.audio.TurnBeeper.swapChannels = settings.swapBeepChannels
+                            com.opendash.app.audio.TurnBeeper.preview()
+                        },
+                    ) { MonoValue("Play ›") }
+                    SettingsRow(
+                        "Hear overspeed alert", showDivider = true,
+                        onClick = {
+                            runCatching {
+                                // Match the live alert: alarm stream, max volume.
+                                val tg = android.media.ToneGenerator(android.media.AudioManager.STREAM_ALARM, 100)
+                                tg.startTone(android.media.ToneGenerator.TONE_CDMA_ALERT_CALL_GUARD, 400)
+                                android.os.Handler(android.os.Looper.getMainLooper())
+                                    .postDelayed({ runCatching { tg.release() } }, 800)
+                            }
+                        },
+                    ) { MonoValue("Play ›") }
+                    SettingsRow("Engine detect (vibration)", showDivider = true) {
+                        KtmToggle(engineDetect, {
+                            engineDetect = it; settings.engineDetectEnabled = it
+                            BccuConnectionService.reevaluateEngineDetectIfRunning()
+                        })
+                    }
+                    SettingsRow("Calibrate engine detect", showDivider = true, onClick = onOpenVibrationCalibration) {
+                        val calibrated = !settings.vibrationIdleRms.isNaN()
+                        MonoValue(if (calibrated) "Calibrated ›" else "Set up ›")
+                    }
+                    SettingsRow(
+                        "Detection sensitivity", showDivider = true,
+                        onClick = {
+                            vibSensitivity = when (vibSensitivity) {
+                                -25 -> 0; 0 -> 25; else -> -25
+                            }
+                            settings.vibrationSensitivity = vibSensitivity
+                            BccuConnectionService.reevaluateEngineDetectIfRunning()
+                        },
+                    ) {
+                        MonoValue(
+                            when {
+                                vibSensitivity < 0 -> "More sensitive ›"
+                                vibSensitivity > 0 -> "Less sensitive ›"
+                                else -> "Normal ›"
+                            }
+                        )
+                    }
+                    SettingsRow("Power saver (full rate on charge)", showDivider = true) {
+                        KtmToggle(powerSave, {
+                            powerSave = it; settings.powerSaveEnabled = it
+                            BccuConnectionService.reevaluateRouteRecordingIfRunning()
+                            BccuConnectionService.reevaluateEngineDetectIfRunning()
+                        })
+                    }
+                    SettingsRow("View rides", showDivider = true, onClick = onOpenRides) {
+                        MonoValue("${com.opendash.app.location.RouteRecorder.listRoutes(context).size} ›")
+                    }
+                    SettingsRow("Overspeed alert", showDivider = true) {
+                        KtmToggle(overspeedEnabled, { overspeedEnabled = it; settings.overspeedEnabled = it })
+                    }
+                    // "Allow all the time" is a SEPARATE grant from the normal
+                    // location permission and can't be requested in the same
+                    // dialog - without it, GPS features are dead whenever the
+                    // service auto-started in the background (boot / bike
+                    // reconnect) rather than from the app being open.
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        var bgLocationGranted by remember {
+                            mutableStateOf(
+                                androidx.core.content.ContextCompat.checkSelfPermission(
+                                    context, android.Manifest.permission.ACCESS_BACKGROUND_LOCATION
+                                ) == PackageManager.PERMISSION_GRANTED
+                            )
+                        }
+                        val bgLocationLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
+                            androidx.activity.result.contract.ActivityResultContracts.RequestPermission()
+                        ) { granted ->
+                            bgLocationGranted = granted
+                            if (granted) {
+                                BccuConnectionService.reevaluateLocationIfRunning()
+                            } else {
+                                // Android suppresses the request UI after repeated
+                                // denials (or when foreground location is missing) -
+                                // never leave this as a silent dead button.
+                                android.widget.Toast.makeText(
+                                    context,
+                                    "Choose \"Allow all the time\" under Permissions → Location",
+                                    android.widget.Toast.LENGTH_LONG,
+                                ).show()
+                                context.startActivity(
+                                    Intent(
+                                        AndroidSettings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                                        Uri.parse("package:${context.packageName}"),
+                                    ),
+                                )
+                            }
+                        }
+                        val fineLocationLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
+                            androidx.activity.result.contract.ActivityResultContracts.RequestMultiplePermissions()
+                        ) { result ->
+                            // Background can only be requested once foreground is granted.
+                            if (result[android.Manifest.permission.ACCESS_FINE_LOCATION] == true) {
+                                BccuConnectionService.reevaluateLocationIfRunning()
+                                bgLocationLauncher.launch(android.Manifest.permission.ACCESS_BACKGROUND_LOCATION)
+                            }
+                        }
+                        SettingsRow(
+                            "Background location (\"all the time\")", showDivider = true,
+                            onClick = if (bgLocationGranted) null else ({
+                                val fineGranted = androidx.core.content.ContextCompat.checkSelfPermission(
+                                    context, android.Manifest.permission.ACCESS_FINE_LOCATION
+                                ) == PackageManager.PERMISSION_GRANTED
+                                if (fineGranted) {
+                                    bgLocationLauncher.launch(android.Manifest.permission.ACCESS_BACKGROUND_LOCATION)
+                                } else {
+                                    fineLocationLauncher.launch(arrayOf(
+                                        android.Manifest.permission.ACCESS_FINE_LOCATION,
+                                        android.Manifest.permission.ACCESS_COARSE_LOCATION,
+                                    ))
+                                }
+                            }),
+                        ) {
+                            MonoValue(
+                                if (bgLocationGranted) "Granted" else "Grant ›",
+                                color = if (bgLocationGranted) Ktm.Green else Ktm.Orange,
+                            )
+                        }
+                    }
+                    SettingsRow("Speed limit", showDivider = true, onClick = { dialog = SettingsDialog.OVERSPEED_LIMIT }) {
+                        MonoValue("$overspeedLimit km/h ›")
+                    }
+                    SettingsRow("Auto-record routes while charging", showDivider = true) {
+                        KtmToggle(routeRecordEnabled, {
+                            routeRecordEnabled = it; settings.routeAutoRecordEnabled = it
+                            BccuConnectionService.reevaluateRouteRecordingIfRunning()
+                        })
+                    }
+                    SettingsRow(
+                        "Export recorded routes", showDivider = false,
+                        onClick = { exportRoutes(context) },
+                    ) {
+                        val count = remember(routeRecordEnabled) {
+                            com.opendash.app.location.RouteRecorder.listRoutes(context).size
+                        }
+                        MonoValue("$count GPX ›")
+                    }
+                }
+            }
+
+            // ===== Waypoint =====
+            item {
+                GroupCard("Waypoint") {
+                    SettingsRow("Saved waypoint", showDivider = true) {
+                        MonoValue(waypoint ?: "None")
+                    }
+                    SettingsRow(
+                        "Set to current location", showDivider = true,
+                        onClick = {
+                            val loc = lastKnownLocation(context)
+                            if (loc != null) {
+                                // Locale.US: a comma-decimal locale would corrupt the "lat,lon" format.
+                                val value = "%.6f,%.6f".format(java.util.Locale.US, loc.latitude, loc.longitude)
+                                waypoint = value
+                                settings.waypoint = value
+                                settings.waypointName = "Waypoint"
+                                BccuConnectionService.sendNotificationIfRunning(
+                                    "WAYPOINT SAVED",
+                                    BccuProtocol.NotificationIcon.NOTIFICATION_WAYPOINT,
+                                )
+                            } else {
+                                android.widget.Toast.makeText(context, "No GPS fix yet", android.widget.Toast.LENGTH_SHORT).show()
+                            }
+                        },
+                    ) { OutlinedPill("SET") }
+                    SettingsRow(
+                        "Navigate there (Google Maps)", showDivider = true,
+                        onClick = {
+                            waypoint?.let { wp ->
+                                // google.navigation with mode=l = two-wheeler routing.
+                                val intent = Intent(Intent.ACTION_VIEW, Uri.parse("google.navigation:q=$wp&mode=l"))
+                                    .setPackage("com.google.android.apps.maps")
+                                runCatching { context.startActivity(intent) }.onFailure {
+                                    context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("geo:$wp?q=$wp")))
+                                }
+                            }
+                        },
+                    ) { OutlinedPill("GO") }
+                    SettingsRow(
+                        "Remove waypoint", showDivider = false,
+                        onClick = {
+                            waypoint = null
+                            settings.waypoint = null
+                            settings.waypointName = null
+                        },
+                    ) { OutlinedPill("CLEAR") }
+                }
+            }
+
             // ===== Handlebar gamepad =====
             item {
                 GroupCard("Handlebar gamepad") {
@@ -247,6 +492,11 @@ fun SettingsScreen(
                         KtmToggle(gamepadEnabled, { on ->
                             gamepadEnabled = on
                             settings.gamepadEnabled = on
+                            // remoteMode is what the button pipeline actually gates
+                            // on - without setting it this toggle did nothing (and
+                            // couldn't turn gamepad mode OFF once the handlebar
+                            // overlay had enabled it).
+                            settings.remoteMode = if (on) AppSettings.MODE_GAMEPAD else AppSettings.MODE_MEDIA
                             // Turning it on with the service not yet enabled: send
                             // the rider straight to the accessibility settings.
                             if (on && !accessibilityGranted) {
@@ -336,6 +586,25 @@ fun SettingsScreen(
             onDismiss = { dialog = SettingsDialog.NONE },
             onConfirm = { geminiKey = it; settings.geminiApiKey = it; dialog = SettingsDialog.NONE },
         )
+        SettingsDialog.GEMINI_MODEL -> SingleChoiceDialog(
+            title = "Gemini model",
+            options = AppSettings.GEMINI_MODELS,
+            labelFor = { it },
+            selected = geminiModel,
+            onDismiss = { dialog = SettingsDialog.NONE },
+            onSelect = { geminiModel = it; settings.geminiModel = it; dialog = SettingsDialog.NONE },
+        )
+        SettingsDialog.OVERSPEED_LIMIT -> TextFieldDialog(
+            title = "Overspeed limit (km/h)", initial = overspeedLimit.toString(), label = "km/h",
+            onDismiss = { dialog = SettingsDialog.NONE },
+            onConfirm = { value ->
+                value.trim().toIntOrNull()?.takeIf { it in 30..200 }?.let {
+                    overspeedLimit = it
+                    settings.overspeedLimitKmh = it
+                }
+                dialog = SettingsDialog.NONE
+            },
+        )
         SettingsDialog.NAV_APP -> SingleChoiceDialog(
             title = "Navigation app",
             options = AppSettings.KNOWN_NAV_APPS.toList(),
@@ -372,6 +641,40 @@ fun SettingsScreen(
         )
         SettingsDialog.NONE -> {}
     }
+}
+
+/** Best-available last known fix across providers (GPS preferred). */
+@SuppressLint("MissingPermission")
+private fun lastKnownLocation(context: android.content.Context): android.location.Location? {
+    if (androidx.core.content.ContextCompat.checkSelfPermission(
+            context, android.Manifest.permission.ACCESS_FINE_LOCATION
+        ) != PackageManager.PERMISSION_GRANTED
+    ) return null
+    val lm = context.getSystemService(android.location.LocationManager::class.java)
+    return listOf(
+        android.location.LocationManager.GPS_PROVIDER,
+        android.location.LocationManager.NETWORK_PROVIDER,
+        android.location.LocationManager.PASSIVE_PROVIDER,
+    ).mapNotNull { runCatching { lm.getLastKnownLocation(it) }.getOrNull() }
+        .maxByOrNull { it.time }
+}
+
+/** Share all recorded GPX route files via the app's FileProvider. */
+private fun exportRoutes(context: android.content.Context) {
+    val files = com.opendash.app.location.RouteRecorder.listRoutes(context)
+    if (files.isEmpty()) {
+        android.widget.Toast.makeText(context, "No recorded routes yet", android.widget.Toast.LENGTH_SHORT).show()
+        return
+    }
+    val uris = ArrayList(files.map {
+        androidx.core.content.FileProvider.getUriForFile(context, "com.opendash.app.fileprovider", it)
+    })
+    val intent = Intent(Intent.ACTION_SEND_MULTIPLE).apply {
+        type = "application/gpx+xml"
+        putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris)
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    }
+    context.startActivity(Intent.createChooser(intent, "Export routes"))
 }
 
 private fun maskKey(key: String): String = when {
