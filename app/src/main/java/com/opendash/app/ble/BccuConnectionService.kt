@@ -917,11 +917,30 @@ class BccuConnectionService : LifecycleService() {
                 val mirrored = BccuCrypto.buildMirrored(decrypted)
                 val keys = BccuCrypto.deriveSessionKeys(decrypted, mirrored, iv, secret)
                 sessionKeys = keys
+                // The dash keeps this pool across ignition cycles and resumes
+                // later sessions by key-select alone (no re-derivation), so our
+                // copy must survive disconnects and process death too - persist
+                // it per-MAC or every reconnect stalls on an empty pool.
+                currentDeviceAddress?.let {
+                    AppSettings(this@BccuConnectionService).storeSessionKeys(it, keys)
+                }
                 replyControl(2)
             }
             cmd in 16..31 -> {
                 val keyIndex = cmd and 0x0F
-                val keys = sessionKeys
+                var keys = sessionKeys
+                if (keys == null) {
+                    // Reconnect: the dash skipped GENERATE_KEYS and selected a
+                    // key from the pool it has kept since pairing. Restore the
+                    // pool we persisted then instead of stalling forever.
+                    keys = currentDeviceAddress?.let {
+                        AppSettings(this@BccuConnectionService).loadSessionKeys(it)
+                    }
+                    if (keys != null) {
+                        AppLogger.log("Auth", "Restored persisted session key pool (${keys.size} keys)")
+                        sessionKeys = keys
+                    }
+                }
                 if (keys == null || keyIndex >= keys.size) {
                     AppLogger.log("Auth", "!! Bike selected key index $keyIndex but no key pool yet")
                     return
