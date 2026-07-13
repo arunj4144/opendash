@@ -16,11 +16,11 @@ plugins {
 }
 
 android {
-    namespace = "com.opendash.app"
+    namespace = "com.navigator.app"
     compileSdk = 34
 
     defaultConfig {
-        applicationId = "com.opendash.app"
+        applicationId = "com.navigator.app"
         minSdk = 26
         targetSdk = 34
         // Days-since-epoch: monotonically increasing across builds, so every

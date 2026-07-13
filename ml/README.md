@@ -15,9 +15,9 @@ dataset with zero hand-labeling and never touch anyone's trained weights.
 On a phone/emulator with Google Maps installed and a debug OpenDash build:
 
 ```
-adb shell am start -n com.opendash.app/.ui.MainActivity
-adb shell am broadcast -a com.opendash.app.EXPORT_MANEUVERS
-adb exec-out run-as com.opendash.app tar c files/maneuver_dataset | tar x -C ml/
+adb shell am start -n com.navigator.app/.ui.MainActivity
+adb shell am broadcast -a com.navigator.app.EXPORT_MANEUVERS
+adb exec-out run-as com.navigator.app tar c files/maneuver_dataset | tar x -C ml/
 ```
 
 `MapsIconExporter` renders each `maneuver_*` drawable from the installed Maps
