@@ -142,11 +142,18 @@ class AppSettings(context: Context) {
     /**
      * Whether we've ever completed the BCCU handshake with this bike before.
      * The bike decides whether to show its physical "confirm new pairing"
-     * prompt based on whether our reply to its cmd=HELLO is "I don't know you"
-     * (cmd 0) or "I know you, just refresh keys" (cmd 1) - so this flag, not
-     * the in-memory session key pool (which is intentionally re-derived every
-     * connection per protocol), is what must persist across app/service
-     * restarts to avoid re-prompting on every reconnect.
+     * prompt from its own bond memory (see the HELLO handling in
+     * BccuConnectionService). This flag persists that "known bike" state across
+     * app/service restarts so we don't re-prompt on every reconnect.
+     *
+     * NOTE: contrary to an earlier assumption, the session-key pool is NOT
+     * re-derived on every connection. Field logs on a Gen-3 dash show it keeps
+     * the pool derived at pairing time across ignition cycles and resumes later
+     * sessions by key-select alone (cmd 16..31) with no GENERATE_KEYS. So the
+     * pool must persist too - see [storeSessionKeys]/[loadSessionKeys] - or the
+     * dash's key-select lands on an empty app-side pool and every reconnect
+     * stalls. That was the root cause of the "reconnect after an ignition cycle
+     * is unreliable" bug.
      */
     fun hasPairedBefore(deviceAddress: String): Boolean {
         val key = KEY_PAIRED_PREFIX + deviceAddress.uppercase()
@@ -172,9 +179,49 @@ class AppSettings(context: Context) {
      */
     fun clearPairedBefore(deviceAddress: String) {
         val key = KEY_PAIRED_PREFIX + deviceAddress.uppercase()
-        pairingPrefs.edit().remove(key).commit()
+        // Forgetting a pairing also drops its session-key pool: the pool is only
+        // meaningful together with the dash-side pairing record, and both callers
+        // (user "forget", handshake self-heal after a genuine dash-side key loss)
+        // want a from-scratch HELLO + GENERATE_KEYS next time.
+        pairingPrefs.edit()
+            .remove(key)
+            .remove(KEY_SESSION_KEYS_PREFIX + deviceAddress.uppercase())
+            .commit()
         runCatching { prefs.edit().remove(key).commit() }
     }
+
+    /**
+     * Persist the session-key pool derived during the pairing handshake, keyed
+     * by device MAC. The dash keeps its copy of this pool across ignition cycles
+     * and resumes each later session by selecting a key from it (walking the
+     * pool downward) instead of re-deriving, so the app-side copy MUST survive
+     * disconnects and process death or a silent reconnect is impossible.
+     *
+     * Stored in the plain pairing store (like [markPairedBefore]) so it is as
+     * durable as the "paired before" flag it partners, and so [clearPairedBefore]
+     * drops both atomically. commit() for the same reason markPairedBefore uses
+     * it: the pool must reach disk before the service can be torn down on the
+     * disconnect that often follows authentication.
+     */
+    fun storeSessionKeys(deviceAddress: String, keys: List<ByteArray>) {
+        val joined = keys.joinToString(",") { hex(it) }
+        pairingPrefs.edit()
+            .putString(KEY_SESSION_KEYS_PREFIX + deviceAddress.uppercase(), joined)
+            .commit()
+    }
+
+    /** The persisted session-key pool for this bike, or null if none stored. */
+    fun loadSessionKeys(deviceAddress: String): List<ByteArray>? {
+        val stored = pairingPrefs.getString(KEY_SESSION_KEYS_PREFIX + deviceAddress.uppercase(), null)
+        if (stored.isNullOrEmpty()) return null
+        return stored.split(",").map { unhex(it) }
+    }
+
+    private fun hex(bytes: ByteArray): String =
+        bytes.joinToString("") { "%02x".format(it) }
+
+    private fun unhex(s: String): ByteArray =
+        ByteArray(s.length / 2) { s.substring(it * 2, it * 2 + 2).toInt(16).toByte() }
 
     /** Stereo beep pattern as a turn approaches (left ear = left turn). */
     var turnBeepEnabled: Boolean
@@ -316,6 +363,7 @@ class AppSettings(context: Context) {
         private const val KEY_WAYPOINT_NAME = "waypoint_name"
         private const val KEY_ROUTE_RECORD = "route_auto_record"
         private const val KEY_PAIRED_PREFIX = "paired_before_"
+        private const val KEY_SESSION_KEYS_PREFIX = "session_keys_"
         private const val KEY_ICON_TEST_PREFIX = "icon_test_"
         private const val KEY_TURN_CAL_PREFIX = "turncal_"
 
