@@ -40,6 +40,21 @@ class RemoteControlAccessibilityService : AccessibilityService() {
         /** True while the service is connected/enabled by the user. */
         @Volatile var isRunning: Boolean = false
             private set
+
+        /**
+         * System security surfaces the remote gamepad must never drive: a
+         * spoofed BLE peer must not be able to approve a permission/consent
+         * prompt, confirm an app install, or change system settings by
+         * injecting focus-move + click while one of these is in front.
+         */
+        private val PROTECTED_PACKAGES = setOf(
+            "com.android.systemui",
+            "com.android.settings",
+            "com.android.packageinstaller",
+            "com.google.android.packageinstaller",
+            "com.android.permissioncontroller",
+            "com.google.android.permissioncontroller",
+        )
     }
 
     private var debugReceiver: android.content.BroadcastReceiver? = null
@@ -96,6 +111,18 @@ class RemoteControlAccessibilityService : AccessibilityService() {
         // Leaving gamepad mode must also clear any lingering selection box.
         if (AppSettings(this).remoteMode != AppSettings.MODE_GAMEPAD || AppForegroundState.isForeground) {
             hideHighlight()
+            return
+        }
+
+        // The button stream ultimately originates from the (app-layer, not
+        // cryptographically authenticated) BLE peer, so a spoofed/rogue peer
+        // could inject presses. Never let a remote-driven press click through a
+        // system security surface - permission dialogs, the package installer,
+        // system UI or Settings - where a stray SET/BACK could approve a consent
+        // prompt or dismiss a security warning without the rider's intent.
+        val frontPackage = rootInActiveWindow?.packageName?.toString()
+        if (frontPackage != null && frontPackage in PROTECTED_PACKAGES) {
+            AppLogger.log("Gamepad", "Ignoring $button over protected window $frontPackage")
             return
         }
 

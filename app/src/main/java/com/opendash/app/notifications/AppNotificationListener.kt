@@ -41,7 +41,7 @@ class AppNotificationListener : NotificationListenerService() {
         val extras = sbn.notification.extras
         val title = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString().orEmpty()
         val text = extras.getCharSequence(Notification.EXTRA_TEXT)?.toString().orEmpty()
-        AppLogger.log("Notif", "Posted: pkg=$packageName category=${sbn.notification.category} title=\"$title\"")
+        AppLogger.log("Notif", "Posted: pkg=$packageName category=${sbn.notification.category} title=${redact(title)}")
         if (title.isBlank() && text.isBlank()) return
 
         val isNav = isNavigationNotification(sbn, settings)
@@ -53,12 +53,17 @@ class AppNotificationListener : NotificationListenerService() {
 
         if (isNav) {
             val navText = if (title.isNotBlank()) "$title $text" else text
-            AppLogger.log("Notif", "Nav update from $packageName: distance=\"$title\" road=\"$text\"")
+            AppLogger.log("Notif", "Nav update from $packageName: distance=${redact(title)} road=${redact(text)}")
             // Dump every extras key so we can see, from real logs, exactly which
             // field carries ETA/duration/remaining-distance - no guessing which
             // Android notification extra Google Maps uses for that subtitle line.
-            for (key in extras.keySet()) {
-                AppLogger.log("Notif", "  extra[$key] = ${extras.get(key)}")
+            // DEBUG-only: extra *values* carry the destination road/address
+            // (location PII) and AppLogger mirrors every line to the public
+            // Downloads copy, so raw values must never be emitted in a release.
+            if (com.opendash.app.BuildConfig.DEBUG) {
+                for (key in extras.keySet()) {
+                    AppLogger.log("Notif", "  extra[$key] = ${extras.get(key)}")
+                }
             }
             NotificationRepository.updateNavText(packageName, navText)
             val subText = extras.getCharSequence(Notification.EXTRA_SUB_TEXT)?.toString().orEmpty()
@@ -123,7 +128,7 @@ class AppNotificationListener : NotificationListenerService() {
         }
 
         val combined = if (title.isNotBlank()) "$title: $text" else text
-        AppLogger.log("Notif", "Captured from $packageName ($appLabel): $combined")
+        AppLogger.log("Notif", "Captured from $packageName ($appLabel): ${redact(combined)}")
         NotificationRepository.addEntry(
             NotificationEntry(
                 packageName = packageName,
@@ -241,11 +246,20 @@ class AppNotificationListener : NotificationListenerService() {
             val file = java.io.File(outDir, "${label}__${hash}.png")
             if (file.exists()) return
             java.io.FileOutputStream(file).use { bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, it) }
-            AppLogger.log("Capture", "Saved maneuver icon: text=\"$text\" hash=$hash -> ${file.name}")
+            AppLogger.log("Capture", "Saved maneuver icon: text=${redact(text)} hash=$hash -> ${file.name}")
         } catch (e: Exception) {
             AppLogger.log("Capture", "!! capture failed: $e")
         }
     }
+
+    /**
+     * Redact notification content before logging. [AppLogger] mirrors every line
+     * to a public `Download/OpenDash` copy, so raw titles/bodies/destinations
+     * there would leak private messages and locations to shared storage
+     * (readable by other apps with storage access, over USB/MTP and cloud
+     * backup, and surviving app uninstall). Log only the length, never content.
+     */
+    private fun redact(s: String): String = if (s.isEmpty()) "<empty>" else "<${s.length} chars>"
 
     private fun isNavigationNotification(sbn: StatusBarNotification, settings: AppSettings): Boolean {
         val override = settings.navAppOverride
