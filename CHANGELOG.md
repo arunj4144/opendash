@@ -1,5 +1,74 @@
 # Changelog
 
+## Unreleased (R29–R33)
+
+**The handlebar remote is now a proper controller.** Long-press UP (from any
+screen) opens a mode picker — **Controller**, **Music**, or **Bike (off)** — so
+you choose what the buttons do, and "off" hands them back to the bike as normal.
+- **Controller:** UP/DOWN and left/right act as a D-pad over whatever's on
+  screen, double-click SET to select (it now reliably *opens* apps, not just
+  highlights them), long-press SET to long-click an item, double-click BACK to go
+  back. Great for driving other apps from the bars.
+- **Music:** single UP/DOWN change volume, double UP/DOWN skip to the next or
+  previous track, SET plays/pauses.
+- **Long-press DOWN opens Google Maps** from anywhere.
+- Every press registers cleanly on release, and the app tells a quick tap, a
+  double-click and a press-and-hold apart — tuned from real measurements on the
+  bike.
+
+**Now-playing on the dash.** When the song changes, the track scrolls across the
+dash's bottom bar once — e.g. "Adventure Of A Lifetime by Coldplay".
+
+**Cleaner messages on the dash.** Mirrored messages and notifications are now
+stripped of emoji and symbols the dash can't display, so they read as clean text
+instead of boxes.
+
+**Keys survive a reinstall too.** On top of surviving updates, your pairing keys
+are now included in a scoped backup, so a reinstall or a new phone won't force
+you to re-pair (your private keys like the AI summary key are deliberately left
+out of that backup).
+
+## Unreleased (R28)
+
+**No more re-pairing on every ride (fixed).** The big one. Until now, every time
+you switched the ignition off and on, the dash would ask you to "add device"
+again before navigation would reconnect — because the app wasn't remembering the
+security keys from your first pairing, so the dash saw your phone as brand new
+each time. The app now saves those keys and presents them on reconnect, so the
+dash recognises your phone and links back up **silently, with nothing to tap**.
+Verified on a real bike: after one final pairing, an ignition off/on now
+reconnects in about a second with no prompt on the dash.
+
+Note: the very first reconnect after updating will still ask once (that's when
+the app learns and stores the keys). Every ride after that is automatic.
+
+## Unreleased (R25)
+
+**Automatic bike detection.** The app now recognises which dash it is talking to
+on its own. As soon as it connects it reads the dash's model, firmware and the
+set of features it exposes, and shows the detected type right in the connection
+banner (for example "Navigator Gen 3 (BCCU)"). There is nothing to configure -
+it just identifies your bike.
+
+**Better handling of unsupported bikes.** Previously, if you connected to a dash
+that isn't a Gen-3 BCCU unit, the app would sit on "handshaking" forever with no
+explanation. It now tells you plainly that the dash isn't supported and records a
+full diagnostic log of exactly what that bike exposes. If you have a bike that
+won't pair (some 1290 / 890 reports), please connect once and send the log - that
+is what lets us add your model.
+
+**Reconnect fix.** The saved bike name now refreshes itself every time you
+connect, so it can no longer get stuck showing the wrong name (e.g. a headset)
+after an update.
+
+**A note on older models.** People have asked about support for older KTMs. Those
+bikes (the earlier "MY RIDE" system) don't use the same Bluetooth technology as
+Gen-3 at all - they use an older Bluetooth Classic connection with a completely
+different message format. Supporting them means building a whole second
+connection path, which is planned but not in this build. R25 puts the
+bike-detection groundwork in place so the app can tell the two apart and route
+each correctly once that path exists.
+
 ## v0.2.0-beta - Navigator Gen3 (formerly OpenDash)
 
 This is a large update over the first public release (v0.1.0), and it is a beta. Please expect a few
